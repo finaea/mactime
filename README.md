@@ -44,9 +44,12 @@ day go?".
 
 ## Install
 
-Grab `MacTime-<version>-macos-arm64.dmg`, drag MacTime to Applications, and
-**right-click → Open** on first launch (the build is self-signed, not
-notarized — macOS will complain once).
+Download the latest `MacTime-<version>-macos-arm64.dmg` from
+[**Releases**](https://github.com/finaea/mactime/releases/latest), drag MacTime
+to Applications, and **right-click → Open** on first launch (the build is
+self-signed, not notarized — macOS will complain once).
+
+Requires macOS 15+ on Apple silicon.
 
 On first run, grant the permissions it asks for:
 
