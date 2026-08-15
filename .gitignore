@@ -1,0 +1,15 @@
+# macOS
+.DS_Store
+
+# SwiftPM
+.build/
+Package.resolved
+
+# Build output / packaging artifacts
+publish/
+
+# Local remote-build setup (machine-specific: hardcoded paths + LaunchAgent label)
+tools/*.builder.plist
+tools/build-agent.sh
+.build-request
+.build-result
