@@ -296,17 +296,45 @@ final class DayModel: ObservableObject {
     }
 
     private var refreshTimer: Timer?
+    private var wakeObserver: NSObjectProtocol?
+    /// The shown day was today when it was picked, so it should follow the clock
+    /// across midnight. Cleared once the user browses to some other day.
+    private var followingToday = true
 
     init(store: Store) {
         self.store = store
         self.day = Calendar.current.startOfDay(for: Date())
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            guard let self, self.isToday else { return }
-            self.load()
+            self?.refresh()
+        }
+        // A sleep can span a date change; refresh on wake rather than waiting
+        // out the next 30s tick.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.refresh()
         }
     }
 
-    deinit { refreshTimer?.invalidate() }
+    deinit {
+        refreshTimer?.invalidate()
+        if let wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+    }
+
+    /// Reload the day, rolling `day` over first if the clock crossed midnight
+    /// while we were following today (e.g. the Mac slept through it). Without
+    /// the rollover the view latches onto the day it was opened on forever.
+    private func refresh() {
+        guard followingToday else { return }
+        if !isToday {
+            day = Calendar.current.startOfDay(for: Date())
+            selection = nil
+            zoom = nil
+        }
+        load()
+    }
 
     var dayEnd: Date { Calendar.current.date(byAdding: .day, value: 1, to: day) ?? day }
     var isToday: Bool { Calendar.current.isDateInToday(day) }
@@ -333,6 +361,7 @@ final class DayModel: ObservableObject {
         day = Calendar.current.date(byAdding: .day, value: days, to: day) ?? day
         selection = nil
         zoom = nil
+        followingToday = isToday
         load()
     }
 
@@ -340,6 +369,7 @@ final class DayModel: ObservableObject {
         day = Calendar.current.startOfDay(for: Date())
         selection = nil
         zoom = nil
+        followingToday = true
         load()
     }
 
@@ -347,6 +377,7 @@ final class DayModel: ObservableObject {
         day = Calendar.current.startOfDay(for: date)
         selection = nil
         zoom = nil
+        followingToday = isToday
         load()
     }
 
