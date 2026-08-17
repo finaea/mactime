@@ -11,6 +11,8 @@ struct SettingsView: View {
     @AppStorage(Settings.Key.screenshotIntervalSeconds) private var screenshotIntervalSeconds = 15.0
     @AppStorage(Settings.Key.screenshotRetentionDays) private var screenshotRetentionDays = 14
     @AppStorage(Settings.Key.screenshotQuality) private var screenshotQuality = 0.6
+    @AppStorage(Settings.Key.hoverPreviewOffsetX) private var hoverPreviewOffsetX = -8.0
+    @AppStorage(Settings.Key.hoverPreviewOffsetY) private var hoverPreviewOffsetY = -8.0
 
     @State private var startAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginItemError: String?
@@ -51,6 +53,23 @@ struct SettingsView: View {
                 }
             }
 
+            Section("Timeline hover preview") {
+                offsetRow("Offset X", value: $hoverPreviewOffsetX)
+                offsetRow("Offset Y", value: $hoverPreviewOffsetY)
+                HStack {
+                    Button("Reset to default") {
+                        hoverPreviewOffsetX = -8
+                        hoverPreviewOffsetY = -8
+                    }
+                    Spacer()
+                }
+                Text("Position of the preview's bottom-right corner relative to the cursor. "
+                     + "Negative values sit left of / above the pointer; -8, -8 is tight to the top-left. "
+                     + "Near a boundary the preview stops at the edge of the timeline pane.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
             Section("General") {
                 Toggle("Start at login", isOn: $startAtLogin)
                     .onChange(of: startAtLogin) { applyLoginItem() }
@@ -86,6 +105,22 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: 500)
         .task { await computeDiskUsage() }
+    }
+
+    /// Typed field plus a stepper — nudging by 4pt while watching the preview
+    /// beats guessing a number.
+    private func offsetRow(_ label: String, value: Binding<Double>) -> some View {
+        HStack {
+            Text(label)
+            Spacer()
+            TextField("", value: value, format: .number)
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 70)
+                .multilineTextAlignment(.trailing)
+            Stepper("", value: value, in: -4000...4000, step: 4)
+                .labelsHidden()
+            Text("pt").foregroundStyle(.secondary)
+        }
     }
 
     private func permissionRow(_ label: String, granted: Bool?, pane: String) -> some View {

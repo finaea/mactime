@@ -8,6 +8,9 @@ struct DayView: View {
     @State private var showCalendar = false
     @State private var keyMonitor: Any?
     @State private var scrollMonitor: Any?
+    /// Strip + timeline + overview pane, in "dayArea" coords — the box the
+    /// hover preview is confined to.
+    @State private var timelinePane: CGRect = .zero
 
     init(store: Store) {
         _model = StateObject(wrappedValue: DayModel(store: store))
@@ -18,10 +21,16 @@ struct DayView: View {
             header
             VSplitView {
                 VStack(spacing: 0) {
-                    ScreenshotStrip(shots: model.visibleShots) { shot in
+                    // Same horizontal inset as TimelineArea below — the strip
+                    // and the timeline must share one x scale to line up.
+                    ScreenshotStrip(shots: model.visibleShots,
+                                    visibleFrom: model.visibleFrom,
+                                    visibleTo: model.visibleTo) { shot in
                         model.viewerMode = .frozen(shot)
                     }
+                    .padding(.horizontal, 12)
                     .frame(height: 118)
+                    .background(Color.primary.opacity(0.03))
                     TimelineArea(spans: model.spans, visibleFrom: model.visibleFrom,
                                  visibleTo: model.visibleTo,
                                  dayStart: model.day, dayEnd: model.dayEnd,
@@ -37,6 +46,12 @@ struct DayView: View {
                         .padding(.bottom, 4)
                 }
                 .frame(minHeight: 235)
+                // The hover preview is clamped to this pane, so it never
+                // strays over the header or the details table below.
+                .background(GeometryReader { g in
+                    Color.clear.preference(key: TimelinePaneKey.self,
+                                           value: g.frame(in: .named("dayArea")))
+                })
                 ZStack {
                     HSplitView {
                         DetailsTable(rows: model.detailRows)
@@ -52,8 +67,9 @@ struct DayView: View {
             }
         }
         .coordinateSpace(name: "dayArea")
+        .onPreferenceChange(TimelinePaneKey.self) { timelinePane = $0 }
         .overlay(alignment: .topLeading) {
-            HoverOverlay(state: hoverState, model: model)
+            HoverOverlay(state: hoverState, model: model, bounds: timelinePane)
         }
         .onAppear {
             model.load()
@@ -76,6 +92,14 @@ struct DayView: View {
             let delta = abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY)
                 ? event.scrollingDeltaX : event.scrollingDeltaY
             guard delta != 0 else { return event }
+
+            // Over the viewer image: the wheel zooms the screenshot. Checked
+            // first — a mouse has no pinch gesture, so this is the only way to
+            // zoom without a trackpad.
+            if state.overViewer, model.viewerMode != .closed {
+                model.zoomViewer(by: CGFloat(exp(Double(delta) / 200)))
+                return nil
+            }
 
             if state.point != nil, let z = model.zoom {
                 // pan the timeline
@@ -105,33 +129,38 @@ struct DayView: View {
         }
     }
 
-    /// ManicTime keys: F12 toggles the docked live viewer (follows hover),
-    /// F11 freezes it on the hovered capture, Esc closes it.
+    /// Space cycles the docked viewer: open (live, follows hover) → freeze on
+    /// the hovered capture → back to live. Esc closes. Deliberately not an
+    /// F-key: keyboards whose firmware owns the F-row as media keys (Keychron
+    /// & co.) never deliver F11/F12 to the app at all.
     private func installKeyMonitor() {
         guard keyMonitor == nil else { return }
         let state = hoverState, model = model
-        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
-            switch event.keyCode {
-            case 111: // F12: open, then toggle freeze/unfreeze. Exit is Esc or ✕ only.
-                switch model.viewerMode {
-                case .closed:
-                    model.viewerMode = .live
-                case .live:
-                    if let t = state.time, let shot = model.nearestShot(to: t) {
-                        model.viewerMode = .frozen(shot)
-                    } else if let shot = model.lastLiveShot {
-                        model.viewerMode = .frozen(shot)
-                    }
-                case .frozen:
-                    model.viewerMode = .live
-                }
-                return nil
-            case 103: // F11
+        // Open → live; live → freeze on the hovered (or last shown) capture;
+        // frozen → back to live. Exit is Esc or ✕ only.
+        let toggleViewer = {
+            switch model.viewerMode {
+            case .closed:
+                model.viewerMode = .live
+            case .live:
                 if let t = state.time, let shot = model.nearestShot(to: t) {
                     model.viewerMode = .frozen(shot)
-                    return nil
+                } else if let shot = model.lastLiveShot {
+                    model.viewerMode = .frozen(shot)
                 }
-                return event
+            case .frozen:
+                model.viewerMode = .live
+            }
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+            switch event.keyCode {
+            case 49: // Space (kVK_Space) — only when the day window itself has
+                     // focus: not the Settings window, not the calendar popover,
+                     // and never while a text field is being edited.
+                guard event.window === NSApp.mainWindow,
+                      !(event.window?.firstResponder is NSTextView) else { return event }
+                toggleViewer()
+                return nil
             case 53: // Esc
                 if model.viewerMode != .closed {
                     model.viewerMode = .closed
@@ -172,6 +201,15 @@ struct DayView: View {
             if !model.isToday {
                 Button("Today") { model.goToday() }
             }
+            // Mouse-reachable viewer toggle: the keyboard shortcuts alone are
+            // undiscoverable, and on media-key keyboards F12 never arrives.
+            Button {
+                model.viewerMode = model.viewerMode == .closed ? .live : .closed
+            } label: {
+                Image(systemName: model.viewerMode == .closed
+                      ? "photo.on.rectangle" : "photo.fill.on.rectangle.fill")
+            }
+            .help("Screenshot viewer — follows the timeline hover (Space)")
             Spacer()
             if let sel = model.selection {
                 Text("Selection: \(Format.time.string(from: sel.lowerBound))–\(Format.time.string(from: sel.upperBound))")
@@ -207,58 +245,127 @@ final class HoverState: ObservableObject {
     /// Cursor is over the overview bar — read by the scroll monitor only,
     /// deliberately not published (no view depends on it).
     var overOverview = false
+    /// Cursor is over the docked viewer image, so the scroll wheel zooms the
+    /// screenshot instead of panning the timeline. Also unpublished.
+    var overViewer = false
+}
+
+/// Frame of the strip/timeline/overview pane in "dayArea" coords.
+struct TimelinePaneKey: PreferenceKey {
+    static var defaultValue: CGRect = .zero
+    static func reduce(value: inout CGRect, nextValue: () -> CGRect) { value = nextValue() }
 }
 
 struct HoverOverlay: View {
     @ObservedObject var state: HoverState
     @ObservedObject var model: DayModel
+    /// Pane the preview is confined to; falls back to the whole day area.
+    var bounds: CGRect = .zero
+
+    @AppStorage(Settings.Key.hoverPreviewOffsetX) private var offsetX = -8.0
+    @AppStorage(Settings.Key.hoverPreviewOffsetY) private var offsetY = -8.0
 
     var body: some View {
         GeometryReader { geo in
             if let p = state.point, let t = state.time {
-                HoverTooltip(time: t, span: model.span(at: t),
-                             viewerOpen: model.viewerMode != .closed)
-                    .offset(x: max(8, min(p.x + 16, geo.size.width - 250)),
-                            y: max(8, min(p.y + 20, geo.size.height - 110)))
+                let viewerOpen = model.viewerMode != .closed
+                let shot = model.nearestShot(to: t)
+                let box = HoverTooltip.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen)
+                let full = CGRect(origin: .zero, size: geo.size)
+                // A pane shorter than the box collapses the clamp to a single
+                // value, which parks the preview instead of tracking. Fall back
+                // to the whole area rather than pin it.
+                let pane = bounds.isEmpty ? full : bounds
+                let b = pane.height < box.height + 24 ? full : pane
+                // The configured offset places the box's bottom-right corner;
+                // .offset positions its top-left, hence the subtraction. Doing
+                // it from the bottom-right keeps the gap constant across the
+                // with-thumbnail and timestamp-only sizes.
+                let wantX = p.x + CGFloat(offsetX) - box.width
+                let wantY = p.y + CGFloat(offsetY) - box.height
+                HoverTooltip(time: t, span: model.span(at: t), shot: shot,
+                             viewerOpen: viewerOpen)
+                    .offset(x: clamp(wantX, b.minX + 4, b.maxX - box.width - 4),
+                            y: clamp(wantY, b.minY + 4, b.maxY - box.height - 4))
             }
         }
         .allowsHitTesting(false)
     }
+
+    /// Low bound wins when the pane is smaller than the box, so a cramped
+    /// window pins the preview to the top-left rather than inverting it.
+    private func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat {
+        hi < lo ? lo : min(max(v, lo), hi)
+    }
 }
 
-/// ManicTime-style hover readout: time, then the span under the cursor with
-/// its range and duration. The screenshot itself shows in the docked viewer.
+/// ManicTime-style hover readout: time, the span under the cursor with its
+/// range and duration, and a thumbnail of the nearest capture. The full-size
+/// screenshot shows in the docked viewer (Space).
 struct HoverTooltip: View {
     let time: Date
     let span: ActivitySpan?
+    let shot: ScreenshotRecord?
     let viewerOpen: Bool
 
+    private static let pad: CGFloat = 8
+    private static let gap: CGFloat = 3
+    private static let thumbW: CGFloat = 213
+    private static let thumbH: CGFloat = 120
+    private static let headerH: CGFloat = 52   // time + app row + range row
+    private static let hintH: CGFloat = 15
+
+    /// Exact box size, computed instead of measured. Placement needs it *before*
+    /// layout runs, and reading it back with a PreferenceKey never delivered
+    /// here. Every row below is explicitly framed so this stays truthful.
+    static func boxSize(hasShot: Bool, viewerOpen: Bool) -> CGSize {
+        var h = pad * 2 + headerH
+        if hasShot { h += gap + thumbH }
+        if !viewerOpen { h += gap + hintH }
+        return CGSize(width: pad * 2 + thumbW, height: h)
+    }
+
+    /// Stacked: time + app on top, thumbnail in the middle, viewer hint at the
+    /// bottom.
     var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(Format.time.string(from: time))
-                .font(.caption.weight(.semibold).monospacedDigit())
-            if let span {
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(color(span.kind))
-                        .frame(width: 7, height: 7)
-                    Text(span.kind == .active ? span.appName
-                         : span.kind == .idle ? "Away" : "Sleep")
-                        .font(.caption)
+        VStack(alignment: .leading, spacing: Self.gap) {
+            VStack(alignment: .leading, spacing: Self.gap) {
+                Text(Format.time.string(from: time))
+                    .font(.caption.weight(.semibold).monospacedDigit())
+                if let span {
+                    HStack(spacing: 5) {
+                        Circle()
+                            .fill(color(span.kind))
+                            .frame(width: 7, height: 7)
+                        Text(span.kind == .active ? span.appName
+                             : span.kind == .idle ? "Away" : "Sleep")
+                            .font(.caption)
+                            .lineLimit(1)
+                    }
+                    Text("\(Format.time.string(from: span.start)) – \(Format.time.string(from: span.end)) (\(Format.duration(span.duration)))")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Text("\(Format.time.string(from: span.start)) – \(Format.time.string(from: span.end)) (\(Format.duration(span.duration)))")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                Spacer(minLength: 0)
             }
+            .frame(width: Self.thumbW, height: Self.headerH, alignment: .topLeading)
+
+            if let shot {
+                HoverThumb(shot: shot)
+            }
+
             if !viewerOpen {
-                Text("F12 screenshot viewer")
+                Text("Space · screenshot viewer")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
+                    .frame(width: Self.thumbW, height: Self.hintH, alignment: .leading)
             }
         }
-        .padding(.horizontal, 8)
-        .padding(.vertical, 6)
+        .padding(Self.pad)
+        .frame(width: Self.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen).width,
+               height: Self.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen).height,
+               alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
         .shadow(radius: 6, y: 2)
     }
@@ -268,6 +375,31 @@ struct HoverTooltip: View {
         case .active: return .green
         case .idle: return .gray
         case .sleep: return .indigo
+        }
+    }
+}
+
+/// The small capture preview inside the hover tooltip. Loads the pre-encoded
+/// 120px thumbnail (never the full shot — this re-fires on every hover move)
+/// and keeps it through ImageCache, same as the strip cells.
+private struct HoverThumb: View {
+    let shot: ScreenshotRecord
+    @State private var image: NSImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fit)
+            } else {
+                RoundedRectangle(cornerRadius: 4).fill(.quaternary)
+            }
+        }
+        .frame(width: 213, height: 120)
+        .clipShape(RoundedRectangle(cornerRadius: 4))
+        .task(id: shot.id) {
+            image = await ImageCache.image(path: shot.thumbPath)
         }
     }
 }
@@ -284,9 +416,28 @@ final class DayModel: ObservableObject {
     }
     /// Visible timeline window; nil = the whole day. Driven by the overview bar.
     @Published var zoom: ClosedRange<Date>?
-    @Published var viewerMode: ViewerMode = .closed
-    /// Last capture the live viewer displayed — what a hover-less F12 freezes.
+    @Published var viewerMode: ViewerMode = .closed {
+        didSet { if viewerMode != oldValue { resetViewerTransform() } }
+    }
+    /// Viewer zoom/pan. Lives here rather than in DockedViewer so the scroll
+    /// monitor can drive the zoom — a mouse wheel has no pinch gesture.
+    @Published var viewerZoom: CGFloat = 1
+    @Published var viewerPan: CGSize = .zero
+    /// Last capture the live viewer displayed — what a hover-less Space freezes.
     var lastLiveShot: ScreenshotRecord?
+
+    static let maxViewerZoom: CGFloat = 8
+
+    func resetViewerTransform() {
+        viewerZoom = 1
+        viewerPan = .zero
+    }
+
+    /// Zoom about the viewer centre, dropping the pan once we're back to fit.
+    func zoomViewer(by factor: CGFloat) {
+        viewerZoom = min(Self.maxViewerZoom, max(1, viewerZoom * factor))
+        if viewerZoom == 1 { viewerPan = .zero }
+    }
     @Published var detailRows: [DetailRow] = []
 
     enum ViewerMode: Equatable {
@@ -552,12 +703,16 @@ struct TimelineCanvas: View {
                     }
             )
             .onTapGesture { selection = nil }
-            .onContinuousHover(coordinateSpace: .named("dayArea")) { phase in
+            // Hover in LOCAL space, converted to dayArea by hand. Asking for
+            // .named("dayArea") directly returned a y the overlay couldn't use,
+            // which pinned the preview to the top of its clamp range.
+            .onContinuousHover(coordinateSpace: .local) { phase in
                 switch phase {
-                case .active(let location):
+                case .active(let local):
                     let frame = geo.frame(in: .named("dayArea"))
-                    hoverState.point = location
-                    hoverState.time = time(at: location.x - frame.minX, width: width)
+                    hoverState.point = CGPoint(x: frame.minX + local.x,
+                                               y: frame.minY + local.y)
+                    hoverState.time = time(at: local.x, width: width)
                 case .ended:
                     hoverState.point = nil
                     hoverState.time = nil
@@ -816,6 +971,9 @@ struct DockedViewer: View {
     @ObservedObject var model: DayModel
     @ObservedObject var hoverState: HoverState
     @State private var image: NSImage?
+    /// Gesture anchors: pan offset when the drag began, zoom when the pinch did.
+    @State private var panBase: CGSize = .zero
+    @State private var zoomBase: CGFloat?
 
     private var shot: ScreenshotRecord? {
         switch model.viewerMode {
@@ -851,7 +1009,17 @@ struct DockedViewer: View {
                         .foregroundStyle(.secondary)
                 }
                 Spacer()
-                Text(model.viewerMode == .live ? "Live · F12 freezes · Esc closes" : "Frozen · F12 unfreezes · Esc closes")
+                if model.viewerZoom > 1 {
+                    Button {
+                        model.resetViewerTransform()
+                    } label: {
+                        Text(String(format: "%.0f%% · fit", model.viewerZoom * 100))
+                            .font(.caption.monospacedDigit())
+                    }
+                    .buttonStyle(.plain)
+                    .help("Reset zoom (or double-click the image)")
+                }
+                Text(model.viewerMode == .live ? "Live · Space freezes · Esc closes" : "Frozen · Space unfreezes · Esc closes")
                     .font(.caption)
                     .foregroundStyle(.tertiary)
                 if let current {
@@ -882,18 +1050,60 @@ struct DockedViewer: View {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
+                        .scaleEffect(model.viewerZoom)
+                        .offset(model.viewerPan)
+                        .gesture(panGesture)
+                        .simultaneousGesture(zoomGesture)
+                        .onTapGesture(count: 2) { model.resetViewerTransform() }
                 } else if current != nil {
                     ProgressView()
                 }
             }
+            .clipped()
+            .contentShape(Rectangle())
+            .onHover { hoverState.overViewer = $0 }
         }
         .background(Color(nsColor: .windowBackgroundColor))
         .task(id: current?.id) {
             guard let current else { image = nil; return }
+            // A different capture means the old zoom/pan no longer refers to
+            // anything — start it back at fit. Live mode changes shot on every
+            // hover move, so this also keeps live from inheriting a stale pan.
+            model.resetViewerTransform()
+            panBase = .zero
+            zoomBase = nil
             model.lastLiveShot = current
             let path = current.path
             image = await Task.detached(priority: .userInitiated) { NSImage(contentsOfFile: path) }.value
         }
+    }
+
+    /// Drag pans the zoomed image. At fit (1×) there's nothing to pan, so the
+    /// gesture stays out of the way.
+    private var panGesture: some Gesture {
+        DragGesture()
+            .onChanged { v in
+                guard model.viewerZoom > 1 else { return }
+                model.viewerPan = CGSize(width: panBase.width + v.translation.width,
+                                         height: panBase.height + v.translation.height)
+            }
+            .onEnded { _ in panBase = model.viewerPan }
+    }
+
+    /// Trackpad pinch. `zoomBase` anchors the gesture so it scales from where
+    /// it started rather than compounding every frame.
+    private var zoomGesture: some Gesture {
+        MagnificationGesture()
+            .onChanged { scale in
+                if zoomBase == nil { zoomBase = model.viewerZoom }
+                let base = zoomBase ?? 1
+                model.viewerZoom = min(DayModel.maxViewerZoom, max(1, base * scale))
+                if model.viewerZoom == 1 { model.viewerPan = .zero }
+            }
+            .onEnded { _ in
+                zoomBase = nil
+                panBase = model.viewerPan
+            }
     }
 
     @ViewBuilder
@@ -944,35 +1154,69 @@ struct DockedViewer: View {
 
 // ============================================================== screenshot strip
 
+/// Thumbnails sit at their capture time on the *same* x scale as the timeline
+/// below, so a shot lines up with the activity it belongs to. (It used to be a
+/// plain scrolling list, which meant the strip and the timeline agreed about
+/// nothing.)
 struct ScreenshotStrip: View {
     let shots: [ScreenshotRecord]
+    let visibleFrom: Date
+    let visibleTo: Date
     let onOpen: (ScreenshotRecord) -> Void
 
+    private static let thumbW: CGFloat = 156
+
+    private struct Placed: Identifiable {
+        let shot: ScreenshotRecord
+        let x: CGFloat
+        var id: Int64 { shot.id }
+    }
+
     var body: some View {
-        Group {
-            if shots.isEmpty {
-                Text("No screenshots in this range")
-                    .foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                ScrollView(.horizontal) {
-                    LazyHStack(spacing: 4) {
-                        ForEach(shots) { shot in
-                            ThumbCell(shot: shot)
-                                .onTapGesture { onOpen(shot) }
-                        }
+        GeometryReader { geo in
+            let placed = place(width: geo.size.width)
+            ZStack(alignment: .topLeading) {
+                if placed.isEmpty {
+                    Text(shots.isEmpty ? "No screenshots in this range"
+                                       : "Zoom in to see screenshots")
+                        .foregroundStyle(.tertiary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ForEach(placed) { item in
+                        ThumbCell(shot: item.shot, width: Self.thumbW)
+                            .offset(x: item.x, y: 4)
+                            .onTapGesture { onOpen(item.shot) }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 4)
                 }
             }
+            .frame(width: geo.size.width, height: geo.size.height, alignment: .topLeading)
+            .clipped()
         }
-        .background(Color.primary.opacity(0.03))
+    }
+
+    /// Centre each thumbnail on its capture time. Zoomed out, hundreds of shots
+    /// map to the same few pixels — keep the first of any overlapping cluster
+    /// and drop the rest, so what's shown is still exactly where it happened.
+    /// Two displays captured at one instant collapse the same way.
+    private func place(width: CGFloat) -> [Placed] {
+        let span = max(60, visibleTo.timeIntervalSince(visibleFrom))
+        var out: [Placed] = []
+        var lastX = -CGFloat.greatestFiniteMagnitude
+        for shot in shots {
+            let frac = shot.takenAt.timeIntervalSince(visibleFrom) / span
+            guard frac >= 0, frac <= 1 else { continue }
+            let x = width * CGFloat(frac) - Self.thumbW / 2
+            guard x >= lastX + Self.thumbW + 4 else { continue }
+            lastX = x
+            out.append(Placed(shot: shot, x: x))
+        }
+        return out
     }
 }
 
 struct ThumbCell: View {
     let shot: ScreenshotRecord
+    var width: CGFloat = 156
     @State private var image: NSImage?
 
     var body: some View {
@@ -984,15 +1228,15 @@ struct ThumbCell: View {
                         .aspectRatio(contentMode: .fit)
                 } else {
                     RoundedRectangle(cornerRadius: 4).fill(.quaternary)
-                        .frame(width: 150)
                 }
             }
-            .frame(height: 88)
+            .frame(width: width, height: 88)
             .clipShape(RoundedRectangle(cornerRadius: 4))
             Text(Format.time.string(from: shot.takenAt))
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }
+        .frame(width: width)
         .task(id: shot.id) {
             image = await ImageCache.image(path: shot.thumbPath)
         }

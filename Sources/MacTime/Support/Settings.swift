@@ -13,10 +13,18 @@ enum Settings {
             Key.screenshotIntervalSeconds: 15.0,
             Key.screenshotRetentionDays: 14,
             Key.screenshotQuality: 0.6,
+            Key.hoverPreviewOffsetX: -8.0,
+            Key.hoverPreviewOffsetY: -8.0,
         ])
     }
 
     enum Key {
+        /// Offset from the pointer to the hover preview's BOTTOM-RIGHT corner.
+        /// Anchoring that corner (rather than the top-left) keeps the box the
+        /// same distance from the cursor whether or not it has a thumbnail in
+        /// it — the two variants differ in size. Default -8,-8 = top-left tight.
+        static let hoverPreviewOffsetX = "hoverPreviewOffsetX"
+        static let hoverPreviewOffsetY = "hoverPreviewOffsetY"
         static let trackingEnabled = "trackingEnabled"
         static let browserTrackingEnabled = "browserTrackingEnabled"
         static let idleThresholdSeconds = "idleThresholdSeconds"
@@ -33,4 +41,6 @@ enum Settings {
     static var screenshotIntervalSeconds: Double { d.double(forKey: Key.screenshotIntervalSeconds) }
     static var screenshotRetentionDays: Int { d.integer(forKey: Key.screenshotRetentionDays) }
     static var screenshotQuality: Double { d.double(forKey: Key.screenshotQuality) }
+    static var hoverPreviewOffsetX: Double { d.double(forKey: Key.hoverPreviewOffsetX) }
+    static var hoverPreviewOffsetY: Double { d.double(forKey: Key.hoverPreviewOffsetY) }
 }
