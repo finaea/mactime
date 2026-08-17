@@ -28,6 +28,20 @@ enum AX {
         return copyAttr(win, kAXTitleAttribute) as? String
     }
 
+    /// Focused window rect in global display coordinates (top-left origin —
+    /// the same space as CGDisplayBounds, so it can be matched to a display
+    /// without flipping). nil when the app exposes no focused window.
+    static func focusedWindowFrame(pid: pid_t) -> CGRect? {
+        guard let win = focusedWindow(pid: pid),
+              let posRef = copyAttr(win, kAXPositionAttribute),
+              let sizeRef = copyAttr(win, kAXSizeAttribute) else { return nil }
+        var origin = CGPoint.zero
+        var size = CGSize.zero
+        guard AXValueGetValue(posRef as! AXValue, .cgPoint, &origin),
+              AXValueGetValue(sizeRef as! AXValue, .cgSize, &size) else { return nil }
+        return CGRect(origin: origin, size: size)
+    }
+
     /// Firefox exposes no Apple Events for tabs; read the URL out of the focused
     /// window's accessibility tree instead (address-bar text field, or a web area's
     /// AXURL). Bounded breadth-first walk; returns nil when the toolbar is hidden

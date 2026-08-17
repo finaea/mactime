@@ -24,6 +24,9 @@ struct ScreenshotRecord: Identifiable, Equatable {
     let displayID: Int
     let path: String
     let thumbPath: String
+    /// Held the focused window when the round was captured. Rows written before
+    /// this column existed are all false; readers fall back to the first display.
+    var isActive: Bool = false
 }
 
 struct AppTotal: Identifiable {
@@ -92,6 +95,22 @@ final class Store {
         CREATE INDEX IF NOT EXISTS idx_shots_taken ON screenshots(taken_at);
         CREATE INDEX IF NOT EXISTS idx_shots_day ON screenshots(day);
         """)
+
+        // Added after 1.0: which display held the focused window at capture
+        // time. ALTER fails harmlessly once the column exists, and rows written
+        // before this shipped keep 0 — the readers fall back to the first
+        // display of the group, which is what they did before anyway.
+        if !columnExists(table: "screenshots", column: "is_active") {
+            db.exec("ALTER TABLE screenshots ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0;")
+        }
+    }
+
+    private func columnExists(table: String, column: String) -> Bool {
+        var found = false
+        db.run("PRAGMA table_info(\(table));") { s in
+            if Database.text(s, 1) == column { found = true }
+        }
+        return found
     }
 
     // ------------------------------------------------------------- spans
@@ -216,24 +235,28 @@ final class Store {
 
     // ------------------------------------------------------------- screenshots
 
-    func insertScreenshot(takenAt: Date, day: String, displayID: Int, path: String, thumbPath: String) {
+    func insertScreenshot(takenAt: Date, day: String, displayID: Int, path: String,
+                          thumbPath: String, isActive: Bool) {
         db.run("""
-        INSERT INTO screenshots (taken_at, day, display_id, path, thumb_path) VALUES (?,?,?,?,?)
-        """, bind: [takenAt.timeIntervalSince1970, day, displayID, path, thumbPath])
+        INSERT INTO screenshots (taken_at, day, display_id, path, thumb_path, is_active)
+        VALUES (?,?,?,?,?,?)
+        """, bind: [takenAt.timeIntervalSince1970, day, displayID, path, thumbPath,
+                    isActive ? 1 : 0])
     }
 
     func screenshots(from: Date, to: Date) -> [ScreenshotRecord] {
         var out: [ScreenshotRecord] = []
         db.run("""
-        SELECT id, taken_at, display_id, path, thumb_path
-        FROM screenshots WHERE taken_at >= ? AND taken_at < ? ORDER BY taken_at
+        SELECT id, taken_at, display_id, path, thumb_path, is_active
+        FROM screenshots WHERE taken_at >= ? AND taken_at < ? ORDER BY taken_at, display_id
         """, bind: [from.timeIntervalSince1970, to.timeIntervalSince1970]) { s in
             out.append(ScreenshotRecord(
                 id: Database.int64(s, 0),
                 takenAt: Date(timeIntervalSince1970: Database.double(s, 1)),
                 displayID: Int(Database.int64(s, 2)),
                 path: Database.text(s, 3) ?? "",
-                thumbPath: Database.text(s, 4) ?? ""))
+                thumbPath: Database.text(s, 4) ?? "",
+                isActive: Database.int64(s, 5) == 1))
         }
         return out
     }

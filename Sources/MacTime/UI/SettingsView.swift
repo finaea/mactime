@@ -11,6 +11,7 @@ struct SettingsView: View {
     @AppStorage(Settings.Key.screenshotIntervalSeconds) private var screenshotIntervalSeconds = 15.0
     @AppStorage(Settings.Key.screenshotRetentionDays) private var screenshotRetentionDays = 14
     @AppStorage(Settings.Key.screenshotQuality) private var screenshotQuality = 0.6
+    @AppStorage(Settings.Key.showAllDisplays) private var showAllDisplays = false
     @AppStorage(Settings.Key.hoverPreviewOffsetX) private var hoverPreviewOffsetX = -8.0
     @AppStorage(Settings.Key.hoverPreviewOffsetY) private var hoverPreviewOffsetY = -8.0
 
@@ -46,6 +47,13 @@ struct SettingsView: View {
                     Text("30 days").tag(30)
                     Text("90 days").tag(90)
                 }
+                Picker("Show", selection: $showAllDisplays) {
+                    Text("Active display only").tag(false)
+                    Text("All displays, side by side").tag(true)
+                }
+                Text("Every display is always captured — this only changes how many are shown in the strip, hover preview and viewer. \"Active\" is the display that held the focused window.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("JPEG quality", selection: $screenshotQuality) {
                     Text("Low (smaller files)").tag(0.4)
                     Text("Medium").tag(0.6)

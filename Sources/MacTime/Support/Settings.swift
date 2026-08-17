@@ -15,10 +15,14 @@ enum Settings {
             Key.screenshotQuality: 0.6,
             Key.hoverPreviewOffsetX: -8.0,
             Key.hoverPreviewOffsetY: -8.0,
+            Key.showAllDisplays: false,
         ])
     }
 
     enum Key {
+        /// false — show only the display that held the focused window.
+        /// true  — show every display captured at that instant, side by side.
+        static let showAllDisplays = "showAllDisplays"
         /// Offset from the pointer to the hover preview's BOTTOM-RIGHT corner.
         /// Anchoring that corner (rather than the top-left) keeps the box the
         /// same distance from the cursor whether or not it has a thumbnail in
@@ -43,4 +47,5 @@ enum Settings {
     static var screenshotQuality: Double { d.double(forKey: Key.screenshotQuality) }
     static var hoverPreviewOffsetX: Double { d.double(forKey: Key.hoverPreviewOffsetX) }
     static var hoverPreviewOffsetY: Double { d.double(forKey: Key.hoverPreviewOffsetY) }
+    static var showAllDisplays: Bool { d.bool(forKey: Key.showAllDisplays) }
 }

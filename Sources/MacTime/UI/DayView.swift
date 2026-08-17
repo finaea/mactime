@@ -264,13 +264,18 @@ struct HoverOverlay: View {
 
     @AppStorage(Settings.Key.hoverPreviewOffsetX) private var offsetX = -8.0
     @AppStorage(Settings.Key.hoverPreviewOffsetY) private var offsetY = -8.0
+    /// Re-render trigger; DayModel.displayed() reads the value itself.
+    @AppStorage(Settings.Key.showAllDisplays) private var showAllDisplays = false
 
     var body: some View {
         GeometryReader { geo in
             if let p = state.point, let t = state.time {
                 let viewerOpen = model.viewerMode != .closed
-                let shot = model.nearestShot(to: t)
-                let box = HoverTooltip.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen)
+                let span = model.span(at: t)
+                let shots = model.nearestShot(to: t)
+                    .map { DayModel.displayed(model.group(containing: $0)) } ?? []
+                let box = HoverTooltip.boxSize(shotCount: shots.count, hasSpan: span != nil,
+                                               viewerOpen: viewerOpen)
                 let full = CGRect(origin: .zero, size: geo.size)
                 // A pane shorter than the box collapses the clamp to a single
                 // value, which parks the preview instead of tracking. Fall back
@@ -283,8 +288,7 @@ struct HoverOverlay: View {
                 // with-thumbnail and timestamp-only sizes.
                 let wantX = p.x + CGFloat(offsetX) - box.width
                 let wantY = p.y + CGFloat(offsetY) - box.height
-                HoverTooltip(time: t, span: model.span(at: t), shot: shot,
-                             viewerOpen: viewerOpen)
+                HoverTooltip(time: t, span: span, shots: shots, viewerOpen: viewerOpen)
                     .offset(x: clamp(wantX, b.minX + 4, b.maxX - box.width - 4),
                             y: clamp(wantY, b.minY + 4, b.maxY - box.height - 4))
             }
@@ -305,34 +309,57 @@ struct HoverOverlay: View {
 struct HoverTooltip: View {
     let time: Date
     let span: ActivitySpan?
-    let shot: ScreenshotRecord?
+    let shots: [ScreenshotRecord]
     let viewerOpen: Bool
 
     private static let pad: CGFloat = 8
     private static let gap: CGFloat = 3
     private static let thumbW: CGFloat = 213
     private static let thumbH: CGFloat = 120
-    private static let headerH: CGFloat = 52   // time + app row + range row
+    private static let narrowW: CGFloat = 150  // no thumbnail — don't be 213 wide for a clock
+    private static let timeH: CGFloat = 16
+    private static let spanH: CGFloat = 33     // app row + gap + range row
     private static let hintH: CGFloat = 15
+
+    /// Per-display tile in the tooltip. Several displays side by side would make
+    /// a 3x213 monster of a tooltip, so tiles shrink as the count grows while
+    /// the strip and viewer keep full size.
+    static func tileSize(count: Int) -> CGSize {
+        guard count > 1 else { return CGSize(width: thumbW, height: thumbH) }
+        let w = min(thumbW, 420 / CGFloat(count))
+        return CGSize(width: w, height: (w * thumbH / thumbW).rounded())
+    }
 
     /// Exact box size, computed instead of measured. Placement needs it *before*
     /// layout runs, and reading it back with a PreferenceKey never delivered
-    /// here. Every row below is explicitly framed so this stays truthful.
-    static func boxSize(hasShot: Bool, viewerOpen: Bool) -> CGSize {
-        var h = pad * 2 + headerH
-        if hasShot { h += gap + thumbH }
+    /// here. Every row below is explicitly framed so this stays truthful — and
+    /// each one is only counted when it's actually rendered, so a tooltip with
+    /// no span (tracking off) or no capture doesn't reserve a hole for it.
+    static func boxSize(shotCount: Int, hasSpan: Bool, viewerOpen: Bool) -> CGSize {
+        let tile = tileSize(count: shotCount)
+        var h = pad * 2 + timeH
+        if hasSpan { h += gap + spanH }
+        if shotCount > 0 { h += gap + tile.height }
         if !viewerOpen { h += gap + hintH }
-        return CGSize(width: pad * 2 + thumbW, height: h)
+        let content = shotCount > 0
+            ? CGFloat(shotCount) * tile.width + CGFloat(shotCount - 1) * gap
+            : narrowW
+        return CGSize(width: pad * 2 + max(content, narrowW), height: h)
     }
 
     /// Stacked: time + app on top, thumbnail in the middle, viewer hint at the
-    /// bottom.
+    /// bottom. Rows that have nothing to say are omitted, not blanked.
     var body: some View {
+        let box = Self.boxSize(shotCount: shots.count, hasSpan: span != nil, viewerOpen: viewerOpen)
+        let contentW = box.width - Self.pad * 2
+        let tile = Self.tileSize(count: shots.count)
         VStack(alignment: .leading, spacing: Self.gap) {
-            VStack(alignment: .leading, spacing: Self.gap) {
-                Text(Format.time.string(from: time))
-                    .font(.caption.weight(.semibold).monospacedDigit())
-                if let span {
+            Text(Format.time.string(from: time))
+                .font(.caption.weight(.semibold).monospacedDigit())
+                .frame(width: contentW, height: Self.timeH, alignment: .leading)
+
+            if let span {
+                VStack(alignment: .leading, spacing: Self.gap) {
                     HStack(spacing: 5) {
                         Circle()
                             .fill(color(span.kind))
@@ -347,25 +374,26 @@ struct HoverTooltip: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Spacer(minLength: 0)
+                .frame(width: contentW, height: Self.spanH, alignment: .topLeading)
             }
-            .frame(width: Self.thumbW, height: Self.headerH, alignment: .topLeading)
 
-            if let shot {
-                HoverThumb(shot: shot)
+            if !shots.isEmpty {
+                HStack(spacing: Self.gap) {
+                    ForEach(shots) { shot in
+                        HoverThumb(shot: shot, size: tile)
+                    }
+                }
             }
 
             if !viewerOpen {
                 Text("Space · screenshot viewer")
                     .font(.caption2)
                     .foregroundStyle(.tertiary)
-                    .frame(width: Self.thumbW, height: Self.hintH, alignment: .leading)
+                    .frame(width: contentW, height: Self.hintH, alignment: .leading)
             }
         }
         .padding(Self.pad)
-        .frame(width: Self.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen).width,
-               height: Self.boxSize(hasShot: shot != nil, viewerOpen: viewerOpen).height,
-               alignment: .topLeading)
+        .frame(width: box.width, height: box.height, alignment: .topLeading)
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 7))
         .shadow(radius: 6, y: 2)
     }
@@ -384,6 +412,7 @@ struct HoverTooltip: View {
 /// and keeps it through ImageCache, same as the strip cells.
 private struct HoverThumb: View {
     let shot: ScreenshotRecord
+    let size: CGSize
     @State private var image: NSImage?
 
     var body: some View {
@@ -396,7 +425,7 @@ private struct HoverThumb: View {
                 RoundedRectangle(cornerRadius: 4).fill(.quaternary)
             }
         }
-        .frame(width: 213, height: 120)
+        .frame(width: size.width, height: size.height)
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .task(id: shot.id) {
             image = await ImageCache.image(path: shot.thumbPath)
@@ -563,6 +592,39 @@ final class DayModel: ObservableObject {
             abs($0.takenAt.timeIntervalSince(time)) < abs($1.takenAt.timeIntervalSince(time))
         }) else { return nil }
         return abs(best.takenAt.timeIntervalSince(time)) <= 900 ? best : nil
+    }
+
+    // -------------------------------------------------- multi-display grouping
+
+    /// One capture round = one row per display, all sharing a timestamp.
+    /// Splitting on the timestamp keeps displays together no matter how many
+    /// are attached (and it changes: this Mac has gone 1 -> 2 -> 3 today).
+    static func groups(of shots: [ScreenshotRecord]) -> [[ScreenshotRecord]] {
+        var out: [[ScreenshotRecord]] = []
+        for shot in shots {
+            if let first = out.last?.first,
+               abs(first.takenAt.timeIntervalSince(shot.takenAt)) < 0.5 {
+                out[out.count - 1].append(shot)
+            } else {
+                out.append([shot])
+            }
+        }
+        return out.map { $0.sorted { $0.displayID < $1.displayID } }
+    }
+
+    /// The captures a group should actually render, per the display setting.
+    /// In single mode prefer the display that held focus; pre-1.0 rows have no
+    /// such flag, so fall back to the first display rather than showing nothing.
+    static func displayed(_ group: [ScreenshotRecord]) -> [ScreenshotRecord] {
+        if Settings.showAllDisplays { return group }
+        if let active = group.first(where: \.isActive) { return [active] }
+        return Array(group.prefix(1))
+    }
+
+    /// Every display captured at the same instant as `shot`.
+    func group(containing shot: ScreenshotRecord) -> [ScreenshotRecord] {
+        let peers = shots.filter { abs($0.takenAt.timeIntervalSince(shot.takenAt)) < 0.5 }
+        return peers.isEmpty ? [shot] : peers.sorted { $0.displayID < $1.displayID }
     }
 
     func load() {
@@ -970,7 +1032,9 @@ struct OverviewBar: View {
 struct DockedViewer: View {
     @ObservedObject var model: DayModel
     @ObservedObject var hoverState: HoverState
-    @State private var image: NSImage?
+    /// One image per display shown for the current capture round.
+    @State private var images: [NSImage] = []
+    @AppStorage(Settings.Key.showAllDisplays) private var showAllDisplays = false
     /// Gesture anchors: pan offset when the drag began, zoom when the pinch did.
     @State private var panBase: CGSize = .zero
     @State private var zoomBase: CGFloat?
@@ -1046,15 +1110,21 @@ struct DockedViewer: View {
 
             ZStack {
                 Color.black.opacity(0.85)
-                if let image {
-                    Image(nsImage: image)
-                        .resizable()
-                        .aspectRatio(contentMode: .fit)
-                        .scaleEffect(model.viewerZoom)
-                        .offset(model.viewerPan)
-                        .gesture(panGesture)
-                        .simultaneousGesture(zoomGesture)
-                        .onTapGesture(count: 2) { model.resetViewerTransform() }
+                if !images.isEmpty {
+                    // Displays side by side share one zoom/pan, so the round
+                    // stays aligned while you inspect it.
+                    HStack(spacing: 4) {
+                        ForEach(Array(images.enumerated()), id: \.offset) { _, img in
+                            Image(nsImage: img)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                        }
+                    }
+                    .scaleEffect(model.viewerZoom)
+                    .offset(model.viewerPan)
+                    .gesture(panGesture)
+                    .simultaneousGesture(zoomGesture)
+                    .onTapGesture(count: 2) { model.resetViewerTransform() }
                 } else if current != nil {
                     ProgressView()
                 }
@@ -1064,8 +1134,10 @@ struct DockedViewer: View {
             .onHover { hoverState.overViewer = $0 }
         }
         .background(Color(nsColor: .windowBackgroundColor))
-        .task(id: current?.id) {
-            guard let current else { image = nil; return }
+        // Setting is part of the id so flipping it reloads the right set of
+        // images, not just the layout around them.
+        .task(id: "\(current?.id ?? -1)|\(showAllDisplays)") {
+            guard let current else { images = []; return }
             // A different capture means the old zoom/pan no longer refers to
             // anything — start it back at fit. Live mode changes shot on every
             // hover move, so this also keeps live from inheriting a stale pan.
@@ -1073,8 +1145,10 @@ struct DockedViewer: View {
             panBase = .zero
             zoomBase = nil
             model.lastLiveShot = current
-            let path = current.path
-            image = await Task.detached(priority: .userInitiated) { NSImage(contentsOfFile: path) }.value
+            let paths = DayModel.displayed(model.group(containing: current)).map(\.path)
+            images = await Task.detached(priority: .userInitiated) {
+                paths.compactMap { NSImage(contentsOfFile: $0) }
+            }.value
         }
     }
 
@@ -1114,11 +1188,10 @@ struct DockedViewer: View {
         Button("Show in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: shot.path)])
         }
-        Button("Copy to Clipboard") {
-            if let img = image {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.writeObjects([img])
-            }
+        Button(images.count > 1 ? "Copy All Displays" : "Copy to Clipboard") {
+            guard !images.isEmpty else { return }
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.writeObjects(images)
         }
         Button("Save As…") {
             let panel = NSSavePanel()
@@ -1165,11 +1238,16 @@ struct ScreenshotStrip: View {
     let onOpen: (ScreenshotRecord) -> Void
 
     private static let thumbW: CGFloat = 156
+    private static let tileGap: CGFloat = 3
+    /// Read only so SwiftUI re-lays-out the strip when the setting flips;
+    /// the value itself is applied inside DayModel.displayed().
+    @AppStorage(Settings.Key.showAllDisplays) private var showAllDisplays = false
 
     private struct Placed: Identifiable {
-        let shot: ScreenshotRecord
+        let group: [ScreenshotRecord]
         let x: CGFloat
-        var id: Int64 { shot.id }
+        let width: CGFloat
+        var id: Int64 { group[0].id }
     }
 
     var body: some View {
@@ -1183,9 +1261,14 @@ struct ScreenshotStrip: View {
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ForEach(placed) { item in
-                        ThumbCell(shot: item.shot, width: Self.thumbW)
-                            .offset(x: item.x, y: 4)
-                            .onTapGesture { onOpen(item.shot) }
+                        HStack(spacing: Self.tileGap) {
+                            ForEach(item.group) { shot in
+                                ThumbCell(shot: shot, width: Self.thumbW,
+                                          showTime: shot.id == item.group[0].id)
+                                    .onTapGesture { onOpen(shot) }
+                            }
+                        }
+                        .offset(x: item.x, y: 4)
                     }
                 }
             }
@@ -1194,21 +1277,25 @@ struct ScreenshotStrip: View {
         }
     }
 
-    /// Centre each thumbnail on its capture time. Zoomed out, hundreds of shots
-    /// map to the same few pixels — keep the first of any overlapping cluster
-    /// and drop the rest, so what's shown is still exactly where it happened.
-    /// Two displays captured at one instant collapse the same way.
+    /// Centre each capture round on its time. Zoomed out, hundreds of rounds map
+    /// to the same few pixels — keep the first of any overlapping cluster and
+    /// drop the rest, so what's shown is still exactly where it happened.
+    /// Showing all displays makes each tile wider, so fewer rounds survive.
     private func place(width: CGFloat) -> [Placed] {
         let span = max(60, visibleTo.timeIntervalSince(visibleFrom))
         var out: [Placed] = []
-        var lastX = -CGFloat.greatestFiniteMagnitude
-        for shot in shots {
-            let frac = shot.takenAt.timeIntervalSince(visibleFrom) / span
+        var lastRight = -CGFloat.greatestFiniteMagnitude
+        for group in DayModel.groups(of: shots) {
+            let shown = DayModel.displayed(group)
+            guard let first = shown.first else { continue }
+            let frac = first.takenAt.timeIntervalSince(visibleFrom) / span
             guard frac >= 0, frac <= 1 else { continue }
-            let x = width * CGFloat(frac) - Self.thumbW / 2
-            guard x >= lastX + Self.thumbW + 4 else { continue }
-            lastX = x
-            out.append(Placed(shot: shot, x: x))
+            let w = CGFloat(shown.count) * Self.thumbW
+                + CGFloat(max(0, shown.count - 1)) * Self.tileGap
+            let x = width * CGFloat(frac) - w / 2
+            guard x >= lastRight + 4 else { continue }
+            lastRight = x + w
+            out.append(Placed(group: shown, x: x, width: w))
         }
         return out
     }
@@ -1217,6 +1304,9 @@ struct ScreenshotStrip: View {
 struct ThumbCell: View {
     let shot: ScreenshotRecord
     var width: CGFloat = 156
+    /// Only the leftmost tile of a round labels the time — repeating it under
+    /// every display of the same instant is noise.
+    var showTime = true
     @State private var image: NSImage?
 
     var body: some View {
@@ -1232,7 +1322,7 @@ struct ThumbCell: View {
             }
             .frame(width: width, height: 88)
             .clipShape(RoundedRectangle(cornerRadius: 4))
-            Text(Format.time.string(from: shot.takenAt))
+            Text(showTime ? Format.time.string(from: shot.takenAt) : " ")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
         }

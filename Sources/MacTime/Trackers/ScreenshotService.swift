@@ -65,6 +65,33 @@ final class ScreenshotService {
         return (dict["CGSSessionScreenIsLocked"] as? Bool) ?? false
     }
 
+    /// Display holding the focused window — "the screen you're working on".
+    /// Falls back to the pointer's display, then the main display, so this
+    /// always names one of the captured displays even without Accessibility.
+    @MainActor
+    private static func activeDisplayID() -> CGDirectDisplayID {
+        if AX.trusted, let app = NSWorkspace.shared.frontmostApplication,
+           let frame = AX.focusedWindowFrame(pid: app.processIdentifier),
+           let id = display(containing: CGPoint(x: frame.midX, y: frame.midY)) {
+            return id
+        }
+        // CGEvent location is already top-left-origin global coords, matching
+        // CGDisplayBounds — no flipping needed.
+        if let cursor = CGEvent(source: nil)?.location,
+           let id = display(containing: cursor) {
+            return id
+        }
+        return CGMainDisplayID()
+    }
+
+    private static func display(containing point: CGPoint) -> CGDirectDisplayID? {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return nil }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return nil }
+        return ids.prefix(Int(count)).first { CGDisplayBounds($0).contains(point) }
+    }
+
     @MainActor
     private func captureRound(at ts: Date) async {
         do {
@@ -72,6 +99,7 @@ final class ScreenshotService {
             let day = Format.dayKey.string(from: ts)
             let dayDir = store.screenshotsDir.appendingPathComponent(day, isDirectory: true)
             try FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+            let activeID = Self.activeDisplayID()
 
             for display in content.displays {
                 let filter = SCContentFilter(display: display, excludingWindows: [])
@@ -81,14 +109,16 @@ final class ScreenshotService {
                 config.height = Int(filter.contentRect.height * scale)
                 config.showsCursor = true
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-                save(image, displayID: Int(display.displayID), at: ts, day: day, dayDir: dayDir)
+                save(image, displayID: Int(display.displayID), at: ts, day: day, dayDir: dayDir,
+                     isActive: display.displayID == activeID)
             }
         } catch {
             NSLog("MacTime: screenshot round failed (will retry): %@", "\(error)")
         }
     }
 
-    private func save(_ image: CGImage, displayID: Int, at ts: Date, day: String, dayDir: URL) {
+    private func save(_ image: CGImage, displayID: Int, at ts: Date, day: String, dayDir: URL,
+                      isActive: Bool) {
         let quality = Settings.screenshotQuality
         let stamp = Format.time.string(from: ts).replacingOccurrences(of: ":", with: "-")
         let base = "\(stamp)_\(displayID)"
@@ -111,7 +141,8 @@ final class ScreenshotService {
             }
             DispatchQueue.main.async {
                 store.insertScreenshot(takenAt: ts, day: day, displayID: displayID,
-                                       path: fullURL.path, thumbPath: thumbURL.path)
+                                       path: fullURL.path, thumbPath: thumbURL.path,
+                                       isActive: isActive)
             }
         }
     }
