@@ -140,6 +140,14 @@ final class ActivityService {
     }
 
     private func makeSample() -> Sample {
+        // Dark wake: macOS woke itself for maintenance, with no user session.
+        // Tested before the idle clock, which sees only "no input" and would
+        // file the whole night as Away. Asking the power state directly — rather
+        // than inferring it from the display being dark — keeps a screen that
+        // merely slept while you kept working out of this branch.
+        if PowerState.isDarkWake {
+            return Sample(bundleId: "", appName: "Sleep", title: nil, url: nil, kind: .sleep)
+        }
         if IdleMonitor.secondsSinceLastInput() >= Settings.idleThresholdSeconds {
             return Sample(bundleId: "", appName: "Away", title: nil, url: nil, kind: .idle)
         }
