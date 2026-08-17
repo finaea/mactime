@@ -18,15 +18,18 @@
 - **Screenshots** — captures every display on an interval (default 15s) via
   ScreenCaptureKit, full image + thumbnail per display, into per-day folders.
   Auto-prunes past the retention window (default 14 days). Skips capture while
-  the screen is locked or you're idle.
+  the screen is locked or you're idle. Show just the display that held the
+  focused window, or every display side by side.
 - **Activity tracking** — samples the frontmost app + focused window title every
   3s and collapses them into spans. Idle ("Away") spans are backdated to when
   input actually stopped; sleep is backfilled on wake as its own span kind.
+  macOS maintenance dark wakes are recorded as sleep rather than inflating Away.
 - **Browser URLs** — records the active tab URL when a browser is frontmost.
   Safari/Chrome via Apple Events, Firefox via the accessibility tree.
-- **Day tab** — screenshot strip, Status/Apps timeline with drag-to-select,
-  zoomable via the overview bar, details list and day summary. Docked screenshot
-  viewer follows your hover in realtime.
+- **Day tab** — screenshot strip aligned to the clock, Status/Apps timeline with
+  drag-to-select, zoomable via the overview bar, details list and day summary.
+  Hovering the timeline previews the nearest capture; the docked viewer follows
+  your hover in realtime and zooms/pans.
 - **Statistics tab** — From/To range with presets (week, month, YTD, all time…)
   and four charts: Day duration, Top Applications, Top Computer Usage, and an
   attendance calendar heatmap.
@@ -69,10 +72,16 @@ On first run, grant the permissions it asks for:
 | Drag on overview bar | select a zoom window; drag inside to pan, edges to resize |
 | Scroll / pinch on overview bar | zoom in/out |
 | Double-click overview bar | reset to the full day |
-| `F12` | open the docked screenshot viewer (live) · press again to freeze/unfreeze |
-| `F11` | freeze the viewer on the hovered capture |
+| Hover the timeline | preview the nearest capture (position configurable in Settings) |
+| `Space` | open the docked screenshot viewer (live) · press again to freeze/unfreeze |
+| Click a thumbnail | open the viewer frozen on that capture |
+| Scroll / pinch in the viewer | zoom the screenshot (1×–8×) |
+| Drag in the viewer | pan while zoomed · double-click to reset to fit |
 | `Esc` / ✕ | close the viewer |
 | Click the date | calendar popover for jumping to any day |
+
+The viewer is on `Space` rather than an F-key because keyboards whose firmware
+owns the F-row as media keys never deliver `F12` to an app at all.
 
 ## Data
 
@@ -101,7 +110,7 @@ picks the identity up automatically.
 
 ```
 Sources/MacTime/
-├── Trackers/    ActivityService, ScreenshotService, BrowserService, IdleMonitor, AX
+├── Trackers/    ActivityService, ScreenshotService, BrowserService, IdleMonitor, AX, PowerState
 ├── Store/       sqlite3 wrapper + queries (spans, screenshots, day stats)
 ├── UI/          DayView (timeline/viewer/zoom), StatsView (4 charts), Settings
 └── Support/     settings, formatters, app colors, image cache
