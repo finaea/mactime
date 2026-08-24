@@ -206,31 +206,59 @@ final class Store {
 
     /// Per-day rollup for Day duration / Attendance / Computer usage charts:
     /// first + last active moment and per-kind totals, one row per local day.
-    /// Midnight-crossing spans count toward the day they started in.
+    /// Spans are split at local midnight and clamped to [from, to), so each day
+    /// gets only its overlap — a weekend-long sleep span lands on every day it
+    /// covers instead of dumping 48h on the day the lid closed.
     func dayStats(from: Date, to: Date) -> [DayStat] {
-        var out: [DayStat] = []
+        struct Row { let start: Date; let end: Date; let kind: SpanKind }
+        var rows: [Row] = []
         db.run("""
-        SELECT date(start, 'unixepoch', 'localtime') AS day,
-               MIN(CASE WHEN kind = 'active' THEN start END),
-               MAX(CASE WHEN kind = 'active' THEN end END),
-               SUM(CASE WHEN kind = 'active' THEN end - start ELSE 0 END),
-               SUM(CASE WHEN kind = 'idle'   THEN end - start ELSE 0 END),
-               SUM(CASE WHEN kind = 'sleep'  THEN end - start ELSE 0 END)
-        FROM activity_spans
-        WHERE end > ?1 AND start < ?2
-        GROUP BY day ORDER BY day
+        SELECT start, end, kind FROM activity_spans
+        WHERE end > ?1 AND start < ?2 ORDER BY start
         """, bind: [from.timeIntervalSince1970, to.timeIntervalSince1970]) { s in
-            let first = Database.double(s, 1)
-            let last = Database.double(s, 2)
-            out.append(DayStat(
-                dayKey: Database.text(s, 0) ?? "",
-                firstActive: first > 0 ? Date(timeIntervalSince1970: first) : nil,
-                lastActive: last > 0 ? Date(timeIntervalSince1970: last) : nil,
-                activeSeconds: Database.double(s, 3),
-                idleSeconds: Database.double(s, 4),
-                sleepSeconds: Database.double(s, 5)))
+            rows.append(Row(
+                start: Date(timeIntervalSince1970: Database.double(s, 0)),
+                end: Date(timeIntervalSince1970: Database.double(s, 1)),
+                kind: SpanKind(rawValue: Database.text(s, 2) ?? "active") ?? .active))
         }
-        return out
+
+        struct Acc {
+            var first: Date?
+            var last: Date?
+            var active: TimeInterval = 0
+            var idle: TimeInterval = 0
+            var sleep: TimeInterval = 0
+        }
+        let cal = Calendar.current
+        var byDay: [String: Acc] = [:]
+        for row in rows {
+            var cursor = max(row.start, from)
+            let clampedEnd = min(row.end, to)
+            while cursor < clampedEnd {
+                let nextMidnight = cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: cursor))!
+                let sliceEnd = min(clampedEnd, nextMidnight)
+                let key = Format.dayKey.string(from: cursor)
+                var acc = byDay[key, default: Acc()]
+                switch row.kind {
+                case .active:
+                    acc.active += sliceEnd.timeIntervalSince(cursor)
+                    if acc.first.map({ cursor < $0 }) ?? true { acc.first = cursor }
+                    if acc.last.map({ sliceEnd > $0 }) ?? true { acc.last = sliceEnd }
+                case .idle:
+                    acc.idle += sliceEnd.timeIntervalSince(cursor)
+                case .sleep:
+                    acc.sleep += sliceEnd.timeIntervalSince(cursor)
+                }
+                byDay[key] = acc
+                cursor = sliceEnd
+            }
+        }
+        return byDay.keys.sorted().map { key in
+            let acc = byDay[key]!
+            return DayStat(dayKey: key, firstActive: acc.first, lastActive: acc.last,
+                           activeSeconds: acc.active, idleSeconds: acc.idle,
+                           sleepSeconds: acc.sleep)
+        }
     }
 
     // ------------------------------------------------------------- screenshots
