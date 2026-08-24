@@ -75,9 +75,16 @@ final class ActivityService {
 
     @objc private func didWake(_ note: Notification) {
         let now = Date()
-        if let from = sleptAt, now.timeIntervalSince(from) > 5 {
-            _ = store.insertSpan(start: from, end: now, bundleId: "", appName: "Sleep",
-                                 title: nil, url: nil, kind: .sleep)
+        if var from = sleptAt {
+            // Dark-wake ticks record sleep spans while sleptAt is still set
+            // (no didWake fires for them), so backfill only from where the
+            // last recorded span left off — starting at lid close would lay a
+            // second copy of the whole night on top of them.
+            if let prev = store.lastSpanEnd(), prev > from { from = prev }
+            if now.timeIntervalSince(from) > 5 {
+                _ = store.insertSpan(start: from, end: now, bundleId: "", appName: "Sleep",
+                                     title: nil, url: nil, kind: .sleep)
+            }
         }
         sleptAt = nil
         lastTickAt = nil
