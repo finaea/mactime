@@ -13,7 +13,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         Settings.registerDefaults()
-        NSApp.setActivationPolicy(.regular)
+        // Menu-bar-only at launch. macOS dropped the login item "Hide" checkbox in
+        // Ventura and still offers no supported way to tell a login launch from a
+        // manual one, so we never auto-open: the window appears only on an explicit
+        // user action (tray item, or a reopen), which flips us back to .regular.
+        NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = Self.makeMainMenu()
 
         store = Store()
@@ -23,7 +27,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         screenshots.start()
 
         setupStatusItem()
-        showMainWindow()
         writeDiagnostics()
     }
 

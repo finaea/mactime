@@ -33,8 +33,9 @@
 - **Statistics tab** — From/To range with presets (week, month, YTD, all time…)
   and four charts: Day duration, Top Applications, Top Computer Usage, and an
   attendance calendar heatmap.
-- **Menu bar app** — closing the window keeps tracking; the tray icon reopens
-  it. Optional start at login.
+- **Menu bar app** — starts quietly in the menu bar with no window and no dock
+  icon; the tray icon opens the window, closing it keeps tracking. Optional
+  start at login.
 
 ## What it doesn't do
 
