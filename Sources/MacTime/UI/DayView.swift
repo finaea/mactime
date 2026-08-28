@@ -379,7 +379,10 @@ struct HoverTooltip: View {
 
             if !shots.isEmpty {
                 HStack(spacing: Self.gap) {
-                    ForEach(shots) { shot in
+                    // Keyed by slot, not by row id: the nearest capture changes
+                    // on nearly every hover move, and keying by id would hand
+                    // each move a fresh HoverThumb with empty state.
+                    ForEach(Array(shots.enumerated()), id: \.offset) { _, shot in
                         HoverThumb(shot: shot, size: tile)
                     }
                 }
@@ -413,9 +416,16 @@ struct HoverTooltip: View {
 private struct HoverThumb: View {
     let shot: ScreenshotRecord
     let size: CGSize
-    @State private var image: NSImage?
+    /// Last capture this slot finished loading. Outlives a shot change because
+    /// the tooltip keys its tiles by slot.
+    @State private var loaded: NSImage?
 
     var body: some View {
+        // A warm thumbnail draws in this very pass, so crossing into the next
+        // capture never paints the placeholder first. A cold one keeps the
+        // previous tile up while the disk read runs — a fast sweep shows a
+        // slightly stale frame for a few ms instead of strobing grey.
+        let image = ImageCache.cached(path: shot.thumbPath) ?? loaded
         Group {
             if let image {
                 Image(nsImage: image)
@@ -428,7 +438,10 @@ private struct HoverThumb: View {
         .frame(width: size.width, height: size.height)
         .clipShape(RoundedRectangle(cornerRadius: 4))
         .task(id: shot.id) {
-            image = await ImageCache.image(path: shot.thumbPath)
+            // Sweeping fast leaves several loads in flight; a cancelled one must
+            // not land its image on the slot that moved on.
+            let img = await ImageCache.image(path: shot.thumbPath)
+            if !Task.isCancelled { loaded = img }
         }
     }
 }
