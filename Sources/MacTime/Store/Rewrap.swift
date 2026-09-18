@@ -123,20 +123,48 @@ enum Rewrap {
     /// The captures worth looking at, listed up front rather than walked lazily
     /// — `FileManager`'s enumerator can't be iterated from an async context,
     /// and a few thousand URLs is nothing next to the files they name.
+    ///
+    /// Every regular file under `dir`, and deliberately *not* only the ones
+    /// named `.jpg`. This used to filter on the extension, which is precisely
+    /// the whitelist the loop above spends a paragraph explaining it is not:
+    /// case-sensitive, so a `.JPG` or a `.jpeg` went past untouched, and a
+    /// change to the capture format later would have left every new file in the
+    /// clear while this walked by. The `isSealed` check is what makes the broad
+    /// list safe — nothing is sealed twice, so over-reaching costs a read.
+    ///
+    /// What else is actually in a `Screenshots/<day>/` folder, and why sealing
+    /// it is acceptable:
+    ///
+    ///  - **The day folders themselves**, and anything else that isn't a plain
+    ///    file. Skipped — `Data(contentsOf:)` would fail on a directory anyway,
+    ///    and a symlink is the one entry where writing "the file" would rewrite
+    ///    something outside this tree.
+    ///  - **`.DS_Store`.** Finder writes one the moment someone opens the
+    ///    folder, which Settings ▸ Data ▸ Show in Finder invites them to do.
+    ///    Sealing it costs that folder's icon positions once — Finder reads a
+    ///    sealed one as damaged and writes a fresh one — and it holds nothing
+    ///    of ours to lose.
+    ///  - **A temp file left by an atomic write that was interrupted.** Orphan
+    ///    bytes either way; sealing them changes nothing.
+    ///
+    /// The rule that has to keep holding is the loop's: skipping a file must be
+    /// a decision about what the file *is*, never about what it is called.
     private static func candidates(in dir: URL, writtenBefore cutoff: Date) -> [URL] {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .isRegularFileKey,
+                                      .isSymbolicLinkKey]
         guard let walker = FileManager.default.enumerator(
-            at: dir, includingPropertiesForKeys: [.contentModificationDateKey]) else { return [] }
+            at: dir, includingPropertiesForKeys: keys) else { return [] }
         var out: [URL] = []
-        for case let url as URL in walker where url.pathExtension == "jpg" {
+        for case let url as URL in walker {
+            let values = try? url.resourceValues(forKeys: Set(keys))
+            guard values?.isRegularFile == true, values?.isSymbolicLink != true else { continue }
             // Anything written since launch came from `ScreenshotService.save`,
             // which seals before writing, so there is nothing here to do — and
             // skipping it keeps this pass away from a capture that may still be
             // arriving. Reading one half-written and sealing those bytes is the
             // one way this could actually destroy a capture rather than
             // postpone it.
-            let modified = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
-                .contentModificationDate
-            if let modified, modified >= cutoff { continue }
+            if let modified = values?.contentModificationDate, modified >= cutoff { continue }
             out.append(url)
         }
         return out

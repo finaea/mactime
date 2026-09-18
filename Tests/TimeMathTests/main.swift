@@ -1134,7 +1134,7 @@ await { () async -> Void in
     let summary = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
                                      pauseEvery: 1000, pauseNanoseconds: 0)
 
-    check("Rewrap.files seals exactly the one plaintext capture", summary.sealed == 1, "got \(summary.sealed)")
+    check("Rewrap.files seals both plaintext files", summary.sealed == 2, "got \(summary.sealed)")
     check("Rewrap.files reports no failures", summary.failed == 0, "got \(summary.failed)")
     check("the plaintext file is now sealed on disk",
           Crypto.isSealed(try! Data(contentsOf: plainURL)))
@@ -1142,8 +1142,15 @@ await { () async -> Void in
           (try? crypto.open(Data(contentsOf: plainURL))) == plainBytes)
     check("an already-sealed file is left byte-identical",
           (try! Data(contentsOf: sealedURL)) == sealedBytes)
-    check("a non-.jpg file is left completely untouched",
-          (try! Data(contentsOf: nonJpgURL)) == nonJpgBytes)
+    // The name is not what decides. This used to check the opposite — the walk
+    // filtered on `pathExtension == "jpg"` — which is the whitelist `Rewrap`'s
+    // own comments say it deliberately isn't, and which left `.JPG` and `.jpeg`
+    // in the clear. Over-sealing something that wasn't a capture costs a read;
+    // walking past one that was is the failure the whole change exists to stop.
+    check("a file not named .jpg is sealed too",
+          Crypto.isSealed(try! Data(contentsOf: nonJpgURL)))
+    check("and it opens back to exactly what it held",
+          (try? crypto.open(Data(contentsOf: nonJpgURL))) == nonJpgBytes)
 
     let secondPass = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
                                         pauseEvery: 1000, pauseNanoseconds: 0)
@@ -1338,20 +1345,20 @@ do {
     // despite three different nonces (Crypto.seal's whole reason titleTotals
     // can't GROUP BY in SQL any more).
     for i in 0..<3 {
-        store.insertSpan(start: t0.addingTimeInterval(Double(i) * 200),
-                         end: t0.addingTimeInterval(Double(i) * 200 + 100),
-                         bundleId: "app.a", appName: "App A",
-                         title: "Dashboard", url: "https://example.com/dash", kind: .active)
+        _ = store.insertSpan(start: t0.addingTimeInterval(Double(i) * 200),
+                             end: t0.addingTimeInterval(Double(i) * 200 + 100),
+                             bundleId: "app.a", appName: "App A",
+                             title: "Dashboard", url: "https://example.com/dash", kind: .active)
     }
     // Same title, different URL — must stay its own row.
-    store.insertSpan(start: t0.addingTimeInterval(1000), end: t0.addingTimeInterval(1150),
-                     bundleId: "app.a", appName: "App A",
-                     title: "Dashboard", url: "https://example.com/other", kind: .active)
+    _ = store.insertSpan(start: t0.addingTimeInterval(1000), end: t0.addingTimeInterval(1150),
+                         bundleId: "app.a", appName: "App A",
+                         title: "Dashboard", url: "https://example.com/other", kind: .active)
     // Two equal-duration, differently-titled rows for the tie-break check.
-    store.insertSpan(start: t0.addingTimeInterval(3000), end: t0.addingTimeInterval(3010),
-                     bundleId: "app.a", appName: "App A", title: "Zeta", url: nil, kind: .active)
-    store.insertSpan(start: t0.addingTimeInterval(4000), end: t0.addingTimeInterval(4010),
-                     bundleId: "app.a", appName: "App A", title: "Alpha", url: nil, kind: .active)
+    _ = store.insertSpan(start: t0.addingTimeInterval(3000), end: t0.addingTimeInterval(3010),
+                         bundleId: "app.a", appName: "App A", title: "Zeta", url: nil, kind: .active)
+    _ = store.insertSpan(start: t0.addingTimeInterval(4000), end: t0.addingTimeInterval(4010),
+                         bundleId: "app.a", appName: "App A", title: "Alpha", url: nil, kind: .active)
 
     let totals = store.titleTotals(from: t0, to: t0.addingTimeInterval(10_000), bundleId: "app.a")
 
@@ -1388,12 +1395,12 @@ do {
     let store = Store(directory: dir, crypto: crypto)
     let t0 = Date(timeIntervalSince1970: 1_800_000_000)
 
-    store.insertSpan(start: t0, end: t0.addingTimeInterval(600),
-                     bundleId: "com.example.app", appName: "Example",
-                     title: "Something Secret", url: "https://secret.example.com/x", kind: .active)
-    store.insertSpan(start: t0.addingTimeInterval(600), end: t0.addingTimeInterval(900),
-                     bundleId: "com.example.app", appName: "Example",
-                     title: nil, url: nil, kind: .idle)
+    _ = store.insertSpan(start: t0, end: t0.addingTimeInterval(600),
+                         bundleId: "com.example.app", appName: "Example",
+                         title: "Something Secret", url: "https://secret.example.com/x", kind: .active)
+    _ = store.insertSpan(start: t0.addingTimeInterval(600), end: t0.addingTimeInterval(900),
+                         bundleId: "com.example.app", appName: "Example",
+                         title: nil, url: nil, kind: .idle)
 
     let apps = store.appTotals(from: t0, to: t0.addingTimeInterval(900))
     check("appTotals still sums the active seconds for an app with sealed titles",
@@ -1476,8 +1483,8 @@ await { () async -> Void in
 
     store.insertScreenshot(takenAt: takenAt, day: dayKey, displayID: 0,
                            path: shotURL.path, thumbPath: "", isActive: false)
-    store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
-                     bundleId: "x", appName: "X", title: "Sealed span", url: nil, kind: .active)
+    _ = store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
+                         bundleId: "x", appName: "X", title: "Sealed span", url: nil, kind: .active)
 
     let summary = await Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
     check("erase-all with a sealed capture on disk still deletes its screenshot row",
@@ -1519,10 +1526,10 @@ await { () async -> Void in
     defer { try? FileManager.default.removeItem(at: dir) }
     let store = Store(directory: dir, crypto: Crypto(key: randomKey()))
 
-    store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
-                     end: Date(timeIntervalSince1970: 1_800_000_060),
-                     bundleId: "com.example.findme", appName: "Findme",
-                     title: "A Very Findable Secret Title", url: nil, kind: .active)
+    _ = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                         end: Date(timeIntervalSince1970: 1_800_000_060),
+                         bundleId: "com.example.findme", appName: "Findme",
+                         title: "A Very Findable Secret Title", url: nil, kind: .active)
     store.close() // flush the WAL so the finding is checkable in the main file
 
     let dbPath = dir.appendingPathComponent("MacTime.db").path
