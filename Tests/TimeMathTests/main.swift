@@ -1577,6 +1577,225 @@ check("Store.exportDir is a MacTime-specific subdirectory of the temp root, neve
              == URL(fileURLWithPath: NSTemporaryDirectory()).standardizedFileURL,
       "got \(Store.exportDir.path)")
 
+// ============================================================================
+// URLPolicy.origin — "keep only a URL's origin unless asked otherwise". A
+// mistake here is a token going to disk, not a missing row, so the awkward
+// cases get checked by name and then swept for the invariants that actually
+// matter.
+// ============================================================================
+
+do {
+    struct OriginCase { let label: String; let input: String; let expected: String? }
+    let cases: [OriginCase] = [
+        .init(label: "query string and fragment are dropped, leaving just the origin",
+              input: "https://mail.google.com/mail/u/0/#inbox?ik=SECRET",
+              expected: "https://mail.google.com"),
+        .init(label: "a URL-encoded '@' in the userinfo doesn't confuse the userinfo/host split",
+              input: "https://user:p%40ss@host.example/path?x=1",
+              expected: "https://host.example"),
+        // The userinfo/host split must happen on the *last* "@" — a password
+        // is allowed to contain one, and splitting on the first would read
+        // "ss@host.example" as the host.
+        .init(label: "userinfo containing a literal '@' splits on the last '@', not the first",
+              input: "https://user:pa@ss@host.example/path",
+              expected: "https://host.example"),
+        .init(label: "localhost with a non-default port keeps the port — it names which dev server",
+              input: "http://localhost:3000/admin?key=zz",
+              expected: "http://localhost:3000"),
+        .init(label: "default https port (443) is dropped",
+              input: "https://example.com:443/x", expected: "https://example.com"),
+        .init(label: "default http port (80) is dropped",
+              input: "http://example.com:80/x", expected: "http://example.com"),
+        .init(label: "a non-default port is kept",
+              input: "https://example.com:8443/x", expected: "https://example.com:8443"),
+        .init(label: "an IPv4 literal host is treated like any other host",
+              input: "https://192.168.1.5:8080/admin?t=1", expected: "https://192.168.1.5:8080"),
+        // validHost strips an IPv6 literal's brackets before checking it for
+        // forbidden characters (Foundation is inconsistent about whether
+        // `URLComponents.host` keeps them), and assemble() puts them back —
+        // these two pin that round-trip surviving the added rejection.
+        .init(label: "an IPv6 literal keeps its brackets, with a port after them",
+              input: "https://[::1]:3000/x", expected: "https://[::1]:3000"),
+        .init(label: "an IPv6 literal with no port still keeps its brackets",
+              input: "https://[2001:db8::1]/x", expected: "https://[2001:db8::1]"),
+        .init(label: "a space in the host is rejected — a host with a space isn't a host",
+              input: "https://foo bar.com/x", expected: nil),
+        .init(label: "a tab in the host is rejected",
+              input: "https://foo\tbar.com/x", expected: nil),
+        .init(label: "a control character in the host is rejected",
+              input: "https://exa\u{0007}mple.com/x", expected: nil),
+        .init(label: "a hostless file: URL keeps only its scheme — the path is the private part",
+              input: "file:///Users/jack/Documents/Q3%20layoffs.pdf", expected: "file:"),
+        .init(label: "about:blank keeps only its scheme",
+              input: "about:blank", expected: "about:"),
+        .init(label: "a hostless URL with a fragment still keeps only its scheme",
+              input: "about:preferences#privacy", expected: "about:"),
+        .init(label: "a data: URL keeps only its scheme — the payload is entirely private",
+              input: "data:text/html;base64,PHNjcmlwdD4=", expected: "data:"),
+        .init(label: "mailto: keeps only its scheme",
+              input: "mailto:someone@example.com", expected: "mailto:"),
+        .init(label: "scheme and host are lowercased",
+              input: "HTTPS://Mail.Google.COM/X?t=1", expected: "https://mail.google.com"),
+        .init(label: "a punycode IDN host comes back in its Unicode form",
+              input: "https://xn--mnchen-3ya.de/seite?q=geheim", expected: "https://münchen.de"),
+        .init(label: "a Unicode IDN host round-trips to the same origin as its punycode spelling",
+              input: "https://münchen.de/seite?q=geheim", expected: "https://münchen.de"),
+        .init(label: "a non-http(s) app scheme with a host keeps host and drops the path",
+              input: "chrome://settings/passwords", expected: "chrome://settings"),
+        .init(label: "ftp's own default port (21) is dropped like http/https",
+              input: "ftp://user:pw@files.example.com:21/dir", expected: "ftp://files.example.com"),
+        .init(label: "a string with no scheme at all returns nil",
+              input: "not a url at all", expected: nil),
+        .init(label: "an empty string returns nil", input: "", expected: nil),
+        .init(label: "whitespace-only input returns nil", input: "   ", expected: nil),
+        .init(label: "an unparseable port returns nil rather than a guess",
+              input: "https://example.com:notaport/x", expected: nil),
+    ]
+
+    for c in cases {
+        let got = URLPolicy.origin(of: c.input)
+        check(c.label, got == c.expected, "got \(got.debugDescription)")
+    }
+
+    check("leading and trailing whitespace is trimmed before parsing",
+          URLPolicy.origin(of: "  https://example.com/path?x=1  ") == "https://example.com")
+
+    // ---- properties, swept across the whole table above plus a few nastier
+    // inputs of our own — this is the invariant the feature exists for, not
+    // just the specific cases picked to exercise it.
+    let extra = [
+        "https://a:s#ecret@example.com/x?access_token=deadbeef",
+        "https://example.com/reset?SECRET=1#frag",
+        "https://user:pass@example.com:9999/x?token=zzz",
+    ]
+    let allInputs = cases.map(\.input) + extra
+
+    check("no userinfo survives in any result — the most embarrassing possible failure here",
+          allInputs.allSatisfy { input in
+              guard let origin = URLPolicy.origin(of: input) else { return true }
+              return !origin.contains("@")
+          })
+
+    check("no query string, fragment, or token-shaped substring survives in any result",
+          allInputs.allSatisfy { input in
+              guard let origin = URLPolicy.origin(of: input) else { return true }
+              return !origin.contains("?") && !origin.contains("#")
+                  && !origin.contains("token") && !origin.contains("SECRET")
+                  && !origin.contains("access_token")
+          })
+
+    check("origin is idempotent — re-applying it to its own output changes nothing",
+          allInputs.allSatisfy { input in
+              guard let once = URLPolicy.origin(of: input) else { return true }
+              return URLPolicy.origin(of: once) == once
+          })
+}
+
+// ============================================================================
+// CapturePolicy.detail — the exclusion path. What decides whether an app's
+// window title and browser URL are recorded at all.
+// ============================================================================
+
+do {
+    var readCount = 0
+    func countingRead(title: String?, url: String?) -> () -> (title: String?, url: String?) {
+        { readCount += 1; return (title, url) }
+    }
+
+    readCount = 0
+    let excluded = CapturePolicy.detail(
+        for: "com.excluded.app", excludedBundleIDs: ["com.excluded.app"], fullURLs: false,
+        read: countingRead(title: "Secret Title", url: "https://secret.example.com/x?y=1"))
+    check("an excluded app's window title comes back nil", excluded.title == nil)
+    check("an excluded app's URL comes back nil", excluded.url == nil)
+    // The real property: an excluded app's title is never *read*, not read
+    // and then thrown away. Checking only the return value would also pass
+    // for an implementation that reads it and discards the result.
+    check("an excluded app's read() is never called at all",
+          readCount == 0, "got \(readCount)")
+
+    readCount = 0
+    let kept = CapturePolicy.detail(
+        for: "com.ok.app", excludedBundleIDs: ["com.excluded.app"], fullURLs: false,
+        read: countingRead(title: "My Title", url: "https://example.com/path?q=1"))
+    check("a non-excluded app's title passes through untouched", kept.title == "My Title")
+    check("a non-excluded app's URL is stripped to its origin", kept.url == "https://example.com")
+    check("a non-excluded app's read() is called exactly once", readCount == 1, "got \(readCount)")
+
+    let full = CapturePolicy.detail(
+        for: "com.ok.app", excludedBundleIDs: [], fullURLs: true,
+        read: countingRead(title: "My Title", url: "https://example.com/path?q=1"))
+    check("fullURLs: true passes the URL through verbatim, query string included",
+          full.url == "https://example.com/path?q=1")
+
+    let nilURLStripped = CapturePolicy.detail(
+        for: "com.ok.app", excludedBundleIDs: [], fullURLs: false,
+        read: countingRead(title: "T", url: nil))
+    check("a nil URL from read() stays nil in origin-only mode", nilURLStripped.url == nil)
+    check("...and the title still passes through", nilURLStripped.title == "T")
+
+    let nilURLFull = CapturePolicy.detail(
+        for: "com.ok.app", excludedBundleIDs: [], fullURLs: true,
+        read: countingRead(title: "T", url: nil))
+    check("a nil URL from read() stays nil in fullURLs mode too", nilURLFull.url == nil)
+
+    let emptyExclusions = CapturePolicy.detail(
+        for: "com.anything", excludedBundleIDs: [], fullURLs: false,
+        read: countingRead(title: "X", url: nil))
+    check("an empty excludedBundleIDs set excludes nothing", emptyExclusions.title == "X")
+
+    let notPrefixExcluded = CapturePolicy.detail(
+        for: "com.foo.barbaz", excludedBundleIDs: ["com.foo.bar"], fullURLs: false,
+        read: countingRead(title: "T", url: nil))
+    check("excluding com.foo.bar does not exclude com.foo.barbaz — no prefix matching",
+          notPrefixExcluded.title == "T")
+
+    let notSubstringExcluded = CapturePolicy.detail(
+        for: "com.foo.bar", excludedBundleIDs: ["com.foo.barbaz"], fullURLs: false,
+        read: countingRead(title: "T", url: nil))
+    check("excluding com.foo.barbaz does not exclude com.foo.bar — matching is exact, not substring",
+          notSubstringExcluded.title == "T")
+}
+
+// ------------------------------------------- CapturePolicy end-to-end, via Store
+//
+// The point of exclusion: an excluded app still adds up in the day's totals,
+// it just stops saying what was on screen. Proven against a real Store, the
+// way ActivityService.makeSample actually inserts a span.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+
+    let detail = CapturePolicy.detail(
+        for: "com.excluded.app", excludedBundleIDs: ["com.excluded.app"], fullURLs: false) {
+        ("Password Manager — Vault Unlocked", "https://vault.example.com/unlock?token=abc")
+    }
+
+    let id = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                              end: Date(timeIntervalSince1970: 1_800_000_060),
+                              bundleId: "com.excluded.app", appName: "Password Manager",
+                              title: detail.title, url: detail.url, kind: .active)
+    store.close()
+
+    // Reopening needs the same Crypto passed back — a fresh throwaway key
+    // can't read what the last one wrote.
+    let reopened = Store(directory: dir, crypto: crypto)
+    let span = reopened.spans(from: Date(timeIntervalSince1970: 1_800_000_000),
+                              to: Date(timeIntervalSince1970: 1_800_000_100))
+        .first { $0.id == id }
+
+    check("an excluded app's name survives — the day still has to add up",
+          span?.appName == "Password Manager", "got \(String(describing: span?.appName))")
+    check("...while its title comes back nil, sealing round-trip included",
+          span?.title == nil, "got \(span?.title ?? "nil")")
+    check("...and its URL comes back nil too",
+          span?.url == nil, "got \(span?.url ?? "nil")")
+
+    reopened.close()
+}
+
 // ------------------------------------------------------------------- report
 
 if failures.isEmpty {
