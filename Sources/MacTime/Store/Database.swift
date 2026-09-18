@@ -59,7 +59,7 @@ final class Database {
             // as text would also truncate at the first zero byte, which
             // ciphertext is full of.
             case let d as Data:
-                d.withUnsafeBytes { sqlite3_bind_blob(s, idx, $0.baseAddress, Int32(d.count), SQLITE_TRANSIENT) }
+                _ = d.withUnsafeBytes { sqlite3_bind_blob(s, idx, $0.baseAddress, Int32(d.count), SQLITE_TRANSIENT) }
             default: sqlite3_bind_null(s, idx)
             }
         }

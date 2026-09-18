@@ -222,6 +222,14 @@ final class Store {
     // The column holds both formats for as long as `Rewrap` takes to work
     // through the rows written before this shipped. SQLite's type tag is what
     // separates them — see `unsealed`.
+    //
+    // Every writer here moves the two columns together, so a row is wholly
+    // sealed or wholly plaintext and never a mix of the two. That is a
+    // convention, not a constraint the schema can state, so nothing reading
+    // these columns is allowed to depend on it: each one is judged by its own
+    // `typeof()`, on the way in as well as out. A reader that trusted the row
+    // instead would hand a blob to `Database.text`, which coerces rather than
+    // refusing — see `sealPlaintextSpans` for what that costs.
 
     /// Text for a column, sealed. Empty is stored as NULL rather than as 32
     /// bytes of ciphertext wrapping nothing; every reader already treats the
@@ -360,6 +368,31 @@ final class Store {
         }
     }
 
+    /// What one column of a migrated row should be rewritten with.
+    ///
+    /// The mirror of `unsealed` on the write side, and it branches on the same
+    /// thing for the same reason: a blob is already sealed and is handed back
+    /// byte for byte, so rewriting it is a no-op rather than a re-seal of
+    /// whatever `Database.text` would have made of it.
+    ///
+    /// nil means either "store nothing here" or "couldn't seal it" — the two
+    /// cases the caller has to tell apart with `isPlaintext`.
+    private func resealed(_ value: Database.Value) -> Data? {
+        switch value {
+        case .null: return nil
+        case .blob(let bytes): return bytes
+        case .text(let text): return sealedText(text)
+        }
+    }
+
+    /// Does this column still hold text that has to be sealed? Empty text isn't
+    /// — `sealedText` stores nothing for it, and so a nil back from `resealed`
+    /// is the intended answer rather than a failure.
+    private static func isPlaintext(_ value: Database.Value) -> Bool {
+        if case .text(let text) = value { return !text.isEmpty }
+        return false
+    }
+
     /// Seal one batch of the titles and URLs written before encryption, and say
     /// how many rows it rewrote. Zero means there are none left — which is also
     /// what it returns without a key, so the caller's loop ends rather than
@@ -369,17 +402,29 @@ final class Store {
     /// hasn't been done, one holding a BLOB or NULL has. Nothing records how far
     /// a previous run got, so an interrupted pass costs only its last batch.
     ///
+    /// **Every column is read through its own type tag, not through the row's.**
+    /// The select matches a row when *either* column is still text, and the
+    /// update rewrites both, so the two have to be judged separately. Today no
+    /// writer can produce a row with one column sealed and the other not —
+    /// `insertSpan` seals both or neither, `updateSpanEnd` touches neither, the
+    /// migration moves both — but that invariant is nowhere in the schema and
+    /// nothing would fail if a future writer broke it. It would fail *here*,
+    /// silently and one way: `Database.text` on a blob doesn't return nil,
+    /// SQLite coerces it, so sealed ciphertext would come back as mojibake
+    /// truncated at its first zero byte and be sealed *over* the real value.
+    /// Reading the tag costs nothing and removes the dependency.
+    ///
     /// Batched because `Store` is main-thread-only and a store at the ninety-day
     /// setting holds tens of thousands of these; the caller yields between
     /// batches so the window stays live.
     func sealPlaintextSpans(limit: Int = 500) -> Int {
         guard crypto.isReady else { return 0 }
-        var rows: [(id: Int64, title: String?, url: String?)] = []
+        var rows: [(id: Int64, title: Database.Value, url: Database.Value)] = []
         db.run("""
         SELECT id, window_title, url FROM activity_spans
         WHERE typeof(window_title) = 'text' OR typeof(url) = 'text' LIMIT ?
         """, bind: [limit]) { s in
-            rows.append((Database.int64(s, 0), Database.text(s, 1), Database.text(s, 2)))
+            rows.append((Database.int64(s, 0), Database.value(s, 1), Database.value(s, 2)))
         }
         guard !rows.isEmpty else { return 0 }
 
@@ -391,9 +436,9 @@ final class Store {
         // again rather than assumed.
         var updates: [(id: Int64, title: Data?, url: Data?)] = []
         for row in rows {
-            let title = sealedText(row.title), url = sealedText(row.url)
-            guard (row.title?.isEmpty != false || title != nil),
-                  (row.url?.isEmpty != false || url != nil) else { return 0 }
+            let title = resealed(row.title), url = resealed(row.url)
+            guard (!Self.isPlaintext(row.title) || title != nil),
+                  (!Self.isPlaintext(row.url) || url != nil) else { return 0 }
             updates.append((row.id, title, url))
         }
 
