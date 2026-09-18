@@ -85,6 +85,7 @@ enum Settings {
     static func setExcludedBundleIDs(_ ids: [String]) { d.set(ids, forKey: Key.excludedBundleIDs) }
 
     static var excludedAppsReviewed: Bool { d.bool(forKey: Key.excludedAppsReviewed) }
+    static func setExcludedAppsReviewed(_ reviewed: Bool) { d.set(reviewed, forKey: Key.excludedAppsReviewed) }
     static var idleThresholdSeconds: Double { d.double(forKey: Key.idleThresholdSeconds) }
     static var screenshotsEnabled: Bool { d.bool(forKey: Key.screenshotsEnabled) }
     static var screenshotIntervalSeconds: Double { d.double(forKey: Key.screenshotIntervalSeconds) }

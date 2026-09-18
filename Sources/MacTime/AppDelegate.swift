@@ -28,6 +28,51 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         setupStatusItem()
         writeDiagnostics()
+        offerSuggestedExclusions()
+    }
+
+    // --------------------------------------------------- first-run exclusions
+
+    /// Offered once, on the first launch where any of the suggested apps turns
+    /// out to be installed. Asked here rather than left to whenever the user
+    /// next opens Settings, because the captures an exclusion would have kept
+    /// out of the archive are the ones taken before they got there.
+    ///
+    /// Delayed, because launch is already asking for Accessibility and Screen
+    /// Recording, and a third dialog stacked on the system's two is how people
+    /// end up dismissing all three without reading any of them.
+    ///
+    /// Nothing is excluded without a click, and both buttons are answers —
+    /// "No thanks" is a decision, and it stops the asking too. Coming up with
+    /// nothing to suggest is *not* an answer, so that leaves the question open:
+    /// a password manager installed next month still gets offered.
+    private func offerSuggestedExclusions() {
+        guard !Settings.excludedAppsReviewed else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+            let suggestions = ExcludedApps.suggestions(alreadyExcluded: Settings.excludedBundleIDs)
+            guard !suggestions.isEmpty else { return }
+
+            let names = suggestions.map(\.name).formatted(.list(type: .and))
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Leave \(names) out of MacTime's screenshots?"
+            alert.informativeText = """
+                MacTime can cut these apps' windows out of every screenshot and never record \
+                their window titles or web addresses. Whatever sits behind one is still \
+                captured, and they still count towards your daily totals.
+
+                This doesn't change anything already recorded, and you can edit the list any \
+                time in Settings ▸ Excluded apps.
+                """
+            alert.addButton(withTitle: "Exclude These")
+            alert.addButton(withTitle: "No Thanks")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn {
+                let merged = Settings.excludedBundleIDs.union(suggestions.map(\.bundleID))
+                Settings.setExcludedBundleIDs(Array(merged))
+            }
+            Settings.setExcludedAppsReviewed(true)
+        }
     }
 
     /// Permission ground truth, written where ssh can read it — the unified log
