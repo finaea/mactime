@@ -84,6 +84,9 @@ final class ScreenshotService {
         }
 
         guard Settings.screenshotsEnabled, !isPaused, !capturing else { return }
+        // An erase is sweeping a range right now. Not the same thing as pause —
+        // nothing is shown, nothing is written down, and it lifts by itself.
+        guard !CaptureSuspension.isSuspended else { return }
         guard !Self.isScreenLocked else { return }
         guard IdleMonitor.secondsSinceLastInput() < Settings.idleThresholdSeconds else { return }
         if let last = lastCaptureAt, now.timeIntervalSince(last) < Settings.screenshotIntervalSeconds {
@@ -187,11 +190,16 @@ final class ScreenshotService {
         }
     }
 
-    /// Re-read between the awaits of a round: pause cancels the task, and
-    /// Settings can be switched off while a round is still in the air.
+    /// Re-read between the awaits of a round: pause cancels the task, Settings
+    /// can be switched off while a round is still in the air, and an erase can
+    /// start under one. The last read sits immediately before `save`, so the
+    /// only capture that can still reach the disk after a suspension begins is
+    /// one already past that line with its bytes on the encode queue. That
+    /// narrow window is why `Erase` keeps going round rather than trusting this.
     @MainActor
     private var shouldKeepCapturing: Bool {
         !Task.isCancelled && !isPaused && Settings.screenshotsEnabled
+            && !CaptureSuspension.isSuspended
     }
 
     private func save(_ image: CGImage, displayID: Int, at ts: Date, day: String, dayDir: URL,

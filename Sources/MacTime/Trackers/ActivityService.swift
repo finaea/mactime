@@ -124,7 +124,13 @@ final class ActivityService {
         let now = Date()
         defer { lastTickAt = now }
 
-        guard isTracking else {
+        // An erase is sweeping a range that may well be today's, and capture
+        // carrying on underneath it is how a span outlives the delete that was
+        // meant to take it. Closing the open span first matters as much as
+        // skipping the sample: its row is about to be deleted, and a span left
+        // open across the erase would have its end written back to a row that
+        // no longer exists.
+        guard isTracking, !CaptureSuspension.isSuspended else {
             closeCurrent(at: now)
             return
         }

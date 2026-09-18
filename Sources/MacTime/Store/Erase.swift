@@ -35,6 +35,13 @@ enum Erase {
     @MainActor
     @discardableResult
     static func data(from: Date?, to: Date?, in store: Store) async -> Summary {
+        // Hold capture off for the whole erase. `defer` and not a pair of calls
+        // at top and bottom: there are early returns below, and a hold that
+        // leaks is a tracker that has quietly stopped recording with nothing
+        // anywhere saying so — a worse bug than the one this is closing.
+        CaptureSuspension.begin()
+        defer { CaptureSuspension.end() }
+
         let dir = store.screenshotsDir
         let everything = from == nil && to == nil
         // Read here: `Format.dayKey` is shared mutable state and the sweep runs
@@ -45,10 +52,13 @@ enum Erase {
 
         var screenshots = 0, failed = 0
         // Collect, unlink, then delete exactly what was collected — and go
-        // round for whatever landed in between, because capture doesn't stop
-        // while this runs. Bounded rather than run to a fixed point for the
-        // same reason: a capture that arrives after the last pass belongs to
-        // the next erase, not to an infinite loop.
+        // round for whatever landed in between. The suspension above stops new
+        // rounds and turns back any round that hasn't reached its commit point,
+        // which leaves one case: a capture already past that point, with its
+        // bytes on the encode queue and its row not yet inserted. So the loop
+        // stays. It is bounded rather than run to a fixed point because a
+        // capture arriving after the last pass belongs to the next erase, not
+        // to an infinite loop.
         for _ in 0..<3 {
             let rows = store.screenshotRows(from: from, to: to)
             if rows.isEmpty { break }
