@@ -591,11 +591,14 @@ final class DayModel: ObservableObject {
     }
 
     /// First and last active moment of the loaded day (ManicTime's
-    /// "Day start / Day end / Duration" header).
+    /// "Day start / Day end / Duration" header). Spans are free to cross
+    /// midnight, and `spans` holds every span that *overlaps* the day, so both
+    /// ends are clamped to it — unclamped, the header reports a day start that
+    /// belongs to yesterday evening or a day end that belongs to tomorrow.
     var dayBounds: (start: Date, end: Date)? {
         let active = spans.filter { $0.kind == .active }
-        guard let first = active.first?.start,
-              let last = active.map(\.end).max() else { return nil }
+        guard let first = active.map({ max($0.start, day) }).min(),
+              let last = active.map({ min($0.end, dayEnd) }).max() else { return nil }
         return (first, last)
     }
 
@@ -1166,9 +1169,15 @@ struct DockedViewer: View {
             zoomBase = nil
             model.lastLiveShot = current
             let paths = DayModel.displayed(model.group(containing: current)).map(\.path)
-            images = await Task.detached(priority: .userInitiated) {
+            let loaded = await Task.detached(priority: .userInitiated) {
                 paths.compactMap { NSImage(contentsOfFile: $0) }
             }.value
+            // SwiftUI cancels this task when the hover moves on, but cancelling
+            // it doesn't reach the detached read — so a slow round can still
+            // finish after a newer one and paint the wrong capture. Whoever was
+            // cancelled drops their result instead.
+            guard !Task.isCancelled else { return }
+            images = loaded
         }
     }
 

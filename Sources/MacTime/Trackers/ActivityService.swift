@@ -16,6 +16,11 @@ final class ActivityService {
         didSet { if isPaused { closeCurrent(at: Date()) } }
     }
 
+    /// Whether we should be recording at all. Ticks check this, but so do the
+    /// sleep notifications — they write history without going through a tick,
+    /// and "paused" has to mean paused for the night too, not just while awake.
+    private var isTracking: Bool { Settings.trackingEnabled && !isPaused }
+
     private struct Sample: Equatable {
         var bundleId: String
         var appName: String
@@ -70,12 +75,15 @@ final class ActivityService {
     @objc private func willSleep(_ note: Notification) {
         let now = Date()
         closeCurrent(at: now)
-        sleptAt = now
+        // Arm the backfill only if we were recording when the lid closed.
+        // Pausing before closing it (or switching tracking off) otherwise still
+        // laid the whole night down as a Sleep span on wake.
+        sleptAt = isTracking ? now : nil
     }
 
     @objc private func didWake(_ note: Notification) {
         let now = Date()
-        if var from = sleptAt {
+        if var from = sleptAt, isTracking {
             // Dark-wake ticks record sleep spans while sleptAt is still set
             // (no didWake fires for them), so backfill only from where the
             // last recorded span left off — starting at lid close would lay a
@@ -96,7 +104,7 @@ final class ActivityService {
         let now = Date()
         defer { lastTickAt = now }
 
-        guard Settings.trackingEnabled, !isPaused else {
+        guard isTracking else {
             closeCurrent(at: now)
             return
         }
@@ -110,7 +118,7 @@ final class ActivityService {
                                  title: nil, url: nil, kind: .sleep)
         }
 
-        let sample = makeSample()
+        let sample = makeSample(at: now)
 
         if let cur = current, cur.sample == sample {
             tickCount += 1
@@ -146,7 +154,14 @@ final class ActivityService {
         current = nil
     }
 
-    private func makeSample() -> Sample {
+    /// Re-ask the browser for its URL at least this often, whatever the window
+    /// title says. Slower than the sample interval on purpose — every refresh is
+    /// an Apple Events round-trip — but not so slow that a long read on one page
+    /// gets filed under the one before it.
+    private static let urlRefreshInterval: TimeInterval = 15
+    private var lastURLAt: Date?
+
+    private func makeSample(at now: Date) -> Sample {
         // Dark wake: macOS woke itself for maintenance, with no user session.
         // Tested before the idle clock, which sees only "no input" and would
         // file the whole night as Away. Asking the power state directly — rather
@@ -167,12 +182,18 @@ final class ActivityService {
 
         var url: String?
         if Settings.browserTrackingEnabled, BrowserService.isBrowser(bundleId) {
-            // Same app + same window title as the open span → the tab hasn't changed;
-            // reuse its URL instead of another Apple Events round-trip every 3s.
-            if let cur = current, cur.sample.bundleId == bundleId, cur.sample.title == title {
+            // Same app + same window title as the open span → probably the same
+            // tab; reuse its URL instead of an Apple Events round-trip every 3s.
+            // Only "probably", though: a title is not a URL identifier, and
+            // single page apps (or a site whose pages are all "Inbox") navigate
+            // without ever renaming the window. So the reuse expires — otherwise
+            // every later span stays pinned to the first URL of the session.
+            let fresh = lastURLAt.map { now.timeIntervalSince($0) < Self.urlRefreshInterval } ?? false
+            if fresh, let cur = current, cur.sample.bundleId == bundleId, cur.sample.title == title {
                 url = cur.sample.url
             } else {
                 url = BrowserService.activeURL(bundleId: bundleId, pid: app.processIdentifier)
+                lastURLAt = now
             }
         }
         return Sample(bundleId: bundleId, appName: name, title: title, url: url, kind: .active)

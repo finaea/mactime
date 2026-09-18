@@ -1,0 +1,494 @@
+import Foundation
+
+// Checks for the pure date math in Sources/MacTime/Support/TimeMath.swift.
+//
+// `swift test` builds the app target too, and this Command Line Tools install
+// lacks the SwiftUI macro plugin needed by @State. These are plain checks in a
+// standalone executable so `tools/run-tests.sh` can compile just this file and
+// the two sources it exercises.
+
+var checks = 0
+var failures: [String] = []
+
+func check(_ name: String, _ passed: Bool, _ detail: @autoclosure () -> String = "") {
+    checks += 1
+    guard !passed else { return }
+    let d = detail()
+    failures.append(d.isEmpty ? name : "\(name) — \(d)")
+}
+
+/// Fixed calendar so the range math doesn't depend on the machine's locale.
+/// Weeks start Sunday, matching the attendance grid's assumption.
+let cal: Calendar = {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = TimeZone(identifier: "Europe/London")!
+    c.firstWeekday = 1
+    return c
+}()
+
+func day(_ y: Int, _ m: Int, _ d: Int, _ hh: Int = 0, _ mm: Int = 0) -> Date {
+    cal.date(from: DateComponents(year: y, month: m, day: d, hour: hh, minute: mm))!
+}
+
+// Wednesday 2026-09-16, so "this week" is Sun 13th → today and has days on
+// both sides of it.
+let today = day(2026, 9, 16)
+
+// ----------------------------------------------------------- inclusive length
+
+check("single day counts as one",
+      StatsRange.inclusiveDayCount(from: day(2026, 9, 16), to: day(2026, 9, 16), calendar: cal) == 1)
+
+check("Mon–Sun counts as seven, not six",
+      StatsRange.inclusiveDayCount(from: day(2026, 9, 14), to: day(2026, 9, 20), calendar: cal) == 7,
+      "got \(StatsRange.inclusiveDayCount(from: day(2026, 9, 14), to: day(2026, 9, 20), calendar: cal))")
+
+check("time of day doesn't change the count",
+      StatsRange.inclusiveDayCount(from: day(2026, 9, 14, 23, 30), to: day(2026, 9, 20, 0, 5),
+                                   calendar: cal) == 7)
+
+// --------------------------------------------------------------------- shift
+
+// The bug this guards: a seven-day range has a six-day date difference, so
+// shifting by the difference re-showed the old range's last day.
+do {
+    let from = day(2026, 9, 14), to = day(2026, 9, 20)
+    let next = StatsRange.shifted(step: StatsRange.step(for: .custom), from: from, to: to, by: 1, calendar: cal)
+    check("custom next lands the day after the old range ends",
+          next.from == day(2026, 9, 21), "got \(next.from)")
+    check("custom next keeps the range seven days long",
+          next.to == day(2026, 9, 27), "got \(next.to)")
+
+    let prev = StatsRange.shifted(step: StatsRange.step(for: .custom), from: from, to: to, by: -1, calendar: cal)
+    check("custom previous ends the day before the old range starts",
+          prev.to == day(2026, 9, 13), "got \(prev.to)")
+    check("custom previous round-trips",
+          StatsRange.shifted(step: StatsRange.step(for: .custom), from: prev.from, to: prev.to, by: 1,
+                             calendar: cal) == (from, to))
+}
+
+do {
+    let week = StatsRange.dates(for: .thisWeek, today: today, firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .thisWeek), from: week.from, to: week.to, by: 1,
+                                  calendar: cal)
+    check("week next starts a week later", next.from == day(2026, 9, 20), "got \(next.from)")
+    check("week next covers seven days",
+          StatsRange.inclusiveDayCount(from: next.from, to: next.to, calendar: cal) == 7)
+}
+
+do {
+    let next = StatsRange.shifted(step: StatsRange.step(for: .today), from: today, to: today, by: 1, calendar: cal)
+    check("day next moves both ends together", next.from == day(2026, 9, 17) && next.to == next.from)
+}
+
+do {
+    let month = StatsRange.dates(for: .thisMonth, today: today, firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .thisMonth), from: month.from, to: month.to, by: 1,
+                                  calendar: cal)
+    check("month next starts on the first", next.from == day(2026, 10, 1), "got \(next.from)")
+    check("month next ends just before the month after",
+          next.to == day(2026, 11, 1).addingTimeInterval(-1), "got \(next.to)")
+}
+
+// "Previous X" shares its shift branch with "this X" (both step by the same
+// unit) — check the shared branch actually behaves for the "previous" side too.
+do {
+    let yest = StatsRange.dates(for: .yesterday, today: today, firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .yesterday), from: yest.from, to: yest.to, by: 1, calendar: cal)
+    check("yesterday next lands on today", next == (today, today), "got \(next)")
+}
+
+do {
+    let prevWeek = StatsRange.dates(for: .previousWeek, today: today, firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .previousWeek), from: prevWeek.from, to: prevWeek.to, by: 1,
+                                  calendar: cal)
+    check("previous week next steps forward seven days",
+          next.from == cal.date(byAdding: .day, value: 7, to: prevWeek.from)!,
+          "got \(next.from)")
+    check("previous week next covers seven days",
+          StatsRange.inclusiveDayCount(from: next.from, to: next.to, calendar: cal) == 7)
+}
+
+do {
+    let prevMonth = StatsRange.dates(for: .previousMonth, today: today, firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .previousMonth), from: prevMonth.from, to: prevMonth.to, by: 1,
+                                  calendar: cal)
+    check("previous month next lands on the following month's first day",
+          cal.component(.month, from: next.from) == cal.component(.month, from: prevMonth.from) + 1)
+}
+
+// .yearToDate and .allTime fall into the "anything else" branch: step by the
+// range's own inclusive length rather than a calendar unit.
+do {
+    let ytd = StatsRange.dates(for: .yearToDate, today: today, firstSpanStart: nil, calendar: cal)!
+    let days = StatsRange.inclusiveDayCount(from: ytd.from, to: ytd.to, calendar: cal)
+    let next = StatsRange.shifted(step: StatsRange.step(for: .yearToDate), from: ytd.from, to: ytd.to, by: 1, calendar: cal)
+    check("year-to-date next starts the day after the old range ends",
+          next.from == cal.date(byAdding: .day, value: 1, to: ytd.to)!, "got \(next.from)")
+    check("year-to-date next keeps the same length",
+          StatsRange.inclusiveDayCount(from: next.from, to: next.to, calendar: cal) == days)
+}
+
+do {
+    let all = StatsRange.dates(for: .allTime, today: today, firstSpanStart: day(2026, 9, 1), calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .allTime), from: all.from, to: all.to, by: -1, calendar: cal)
+    check("all time previous ends the day before the old range starts",
+          next.to == cal.date(byAdding: .day, value: -1, to: all.from)!, "got \(next.to)")
+}
+
+// Month shifting has two traps a plain "wrap 12→13" or day-based add would
+// hit: rolling the year, and landing on the target month's own last day
+// rather than carrying over the source month's day count.
+do {
+    let dec = StatsRange.dates(for: .thisMonth, today: day(2026, 12, 15), firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .thisMonth), from: dec.from, to: dec.to, by: 1, calendar: cal)
+    check("month next across a year boundary rolls the year",
+          next.from == day(2027, 1, 1), "got \(next.from)")
+}
+
+do {
+    // January is 31 days; February (2026, not a leap year) is 28. `to` must
+    // land on Feb's last day, not carry Jan's day count forward.
+    let jan = StatsRange.dates(for: .thisMonth, today: day(2026, 1, 15), firstSpanStart: nil, calendar: cal)!
+    let next = StatsRange.shifted(step: StatsRange.step(for: .thisMonth), from: jan.from, to: jan.to, by: 1, calendar: cal)
+    check("month next across a month-length change ends on the shorter month's own last day",
+          next.to == day(2026, 3, 1).addingTimeInterval(-1), "got \(next.to)")
+}
+
+// The bug this guards: stepping makes the range Custom, so keying the step off
+// the *preset* meant only the first click after choosing one walked by its unit
+// — every click after it fell into the by-length branch. Days and weeks are a
+// fixed number of days so they hid it; months are not, and from the second
+// click the range straddled two months and never found a boundary again.
+// Walking "This month" forward four times has to stay on month boundaries.
+do {
+    var range = StatsRange.dates(for: .thisMonth, today: today, firstSpanStart: nil, calendar: cal)!
+    let step = StatsRange.step(for: .thisMonth)   // set once, as the view does
+    var starts: [Date] = []
+    var ends: [Date] = []
+    for _ in 1...4 {
+        range = StatsRange.shifted(step: step, from: range.from, to: range.to, by: 1, calendar: cal)
+        starts.append(range.from)
+        ends.append(range.to)
+    }
+    check("four Next clicks stay on the first of the month",
+          starts == [day(2026, 10, 1), day(2026, 11, 1), day(2026, 12, 1), day(2027, 1, 1)],
+          "got \(starts)")
+    check("four Next clicks stay on each month's own last day",
+          ends == [day(2026, 11, 1), day(2026, 12, 1), day(2027, 1, 1), day(2027, 2, 1)]
+            .map { $0.addingTimeInterval(-1) },
+          "got \(ends)")
+
+    // …and back again: Previous has to undo Next exactly.
+    for _ in 1...4 {
+        range = StatsRange.shifted(step: step, from: range.from, to: range.to, by: -1, calendar: cal)
+    }
+    // Back to September — the month it started in. `to` is now the whole month
+    // rather than the 1st–16th "This month" opened with, which is the point of
+    // stepping.
+    check("four Previous clicks undo the four Next clicks",
+          range.from == day(2026, 9, 1), "got \(range.from)")
+    check("and leave the whole month behind them",
+          range.to == day(2026, 10, 1).addingTimeInterval(-1), "got \(range.to)")
+}
+
+do {
+    // Weeks and days were already correct, but they run the same path now.
+    var range = StatsRange.dates(for: .thisWeek, today: today, firstSpanStart: nil, calendar: cal)!
+    let step = StatsRange.step(for: .thisWeek)
+    for _ in 1...3 {
+        range = StatsRange.shifted(step: step, from: range.from, to: range.to, by: 1, calendar: cal)
+    }
+    check("three week clicks land three Sundays on", range.from == day(2026, 10, 4), "got \(range.from)")
+    check("three week clicks still cover seven days",
+          StatsRange.inclusiveDayCount(from: range.from, to: range.to, calendar: cal) == 7)
+}
+
+check("only the month presets walk in months",
+      StatsRange.Preset.allCases.filter { StatsRange.step(for: $0) == .month }
+        == [.thisMonth, .previousMonth])
+check("presets with no natural unit walk by length",
+      StatsRange.step(for: .yearToDate) == .length && StatsRange.step(for: .allTime) == .length
+        && StatsRange.step(for: .custom) == .length)
+
+// ------------------------------------------------------------ preset identity
+
+// The bug this guards: choosing a preset writes the same dates the user edits,
+// so the pickers' change handler demoted every preset to Custom immediately.
+for preset in StatsRange.Preset.allCases where preset != .custom {
+    let range = StatsRange.dates(for: preset, today: today, firstSpanStart: day(2025, 1, 1),
+                                 calendar: cal)!
+    check("\(preset.rawValue) still recognises its own range",
+          StatsRange.matches(preset: preset, from: range.from, to: range.to, today: today,
+                             firstSpanStart: day(2025, 1, 1), calendar: cal))
+
+    let nudged = cal.date(byAdding: .day, value: -1, to: range.from)!
+    check("\(preset.rawValue) notices an edited From",
+          !StatsRange.matches(preset: preset, from: nudged, to: range.to, today: today,
+                              firstSpanStart: day(2025, 1, 1), calendar: cal))
+
+    // The comparison checks both ends independently — an edit that only
+    // touches To (dragging the end of a range) has to demote the preset too.
+    let nudgedTo = cal.date(byAdding: .day, value: 1, to: range.to)!
+    check("\(preset.rawValue) notices an edited To",
+          !StatsRange.matches(preset: preset, from: range.from, to: nudgedTo, today: today,
+                              firstSpanStart: day(2025, 1, 1), calendar: cal))
+}
+
+// All time is the one preset whose range depends on external state (the
+// store's first span) rather than just `today` — exercise both sides of that.
+check("all time falls back to today when there's no history yet",
+      StatsRange.dates(for: .allTime, today: today, firstSpanStart: nil, calendar: cal)! == (today, today))
+check("all time starts at the first recorded span",
+      StatsRange.dates(for: .allTime, today: today, firstSpanStart: day(2020, 3, 1), calendar: cal)!
+        == (day(2020, 3, 1), today))
+
+check("custom has no canonical range",
+      StatsRange.dates(for: .custom, today: today, firstSpanStart: nil, calendar: cal) == nil)
+check("custom matches whatever it holds",
+      StatsRange.matches(preset: .custom, from: day(2020, 3, 1), to: day(2020, 3, 4), today: today,
+                         firstSpanStart: nil, calendar: cal))
+
+// ------------------------------------------------- what a picker change means
+//
+// `afterDateChange` answers both questions the two `onChange` handlers have to
+// answer, from values alone — they fire for the view's own assignments as well
+// as the user's edits, and run after the new dates are already committed, so
+// there is nothing else left to read. Walked here as the real UI sequences.
+do {
+    let month = StatsRange.dates(for: .thisMonth, today: today, firstSpanStart: nil, calendar: cal)!
+    let monthStep = StatsRange.step(for: .thisMonth)
+
+    // Choosing a preset: its own assignment must not demote it or lose its unit.
+    let chosen = StatsRange.afterDateChange(
+        preset: .thisMonth, step: monthStep, from: month.from, to: month.to,
+        lastAssigned: month, today: today, firstSpanStart: nil, calendar: cal)
+    check("a preset's own range keeps the preset", chosen.preset == .thisMonth)
+    check("a preset's own range keeps its unit", chosen.step == .month)
+
+    // Stepping: the picker becomes Custom (shift sets that itself), and the
+    // range it assigned has to keep walking by month.
+    let stepped = StatsRange.shifted(step: monthStep, from: month.from, to: month.to, by: 1,
+                                     calendar: cal)
+    let afterStep = StatsRange.afterDateChange(
+        preset: .custom, step: monthStep, from: stepped.from, to: stepped.to,
+        lastAssigned: stepped, today: today, firstSpanStart: nil, calendar: cal)
+    check("a stepped range stays Custom", afterStep.preset == .custom)
+    check("a stepped range keeps walking by month", afterStep.step == .month)
+
+    // Hand-editing while a preset is selected: demote and step by length.
+    let editedFrom = cal.date(byAdding: .day, value: 3, to: month.from)!
+    let afterEdit = StatsRange.afterDateChange(
+        preset: .thisMonth, step: monthStep, from: editedFrom, to: month.to,
+        lastAssigned: month, today: today, firstSpanStart: nil, calendar: cal)
+    check("editing a preset's range demotes it to Custom", afterEdit.preset == .custom)
+    check("editing a preset's range steps by length", afterEdit.step == .length)
+
+    // The one this closes: hand-editing *after* a step. `preset` is already
+    // Custom, so `matches` says nothing — only the range differing from the one
+    // the view assigned reveals the edit. Both ends have to count.
+    let editedAfterStep = StatsRange.afterDateChange(
+        preset: .custom, step: monthStep,
+        from: stepped.from, to: cal.date(byAdding: .day, value: -5, to: stepped.to)!,
+        lastAssigned: stepped, today: today, firstSpanStart: nil, calendar: cal)
+    check("editing To after a step drops the month unit", editedAfterStep.step == .length)
+
+    let editedFromAfterStep = StatsRange.afterDateChange(
+        preset: .custom, step: monthStep,
+        from: cal.date(byAdding: .day, value: 5, to: stepped.from)!, to: stepped.to,
+        lastAssigned: stepped, today: today, firstSpanStart: nil, calendar: cal)
+    check("editing From after a step drops the month unit", editedFromAfterStep.step == .length)
+
+    // Nothing assigned yet: whatever is in the pickers is the user's.
+    let unassigned = StatsRange.afterDateChange(
+        preset: .custom, step: monthStep, from: month.from, to: month.to,
+        lastAssigned: nil, today: today, firstSpanStart: nil, calendar: cal)
+    check("with nothing assigned the range is treated as the user's",
+          unassigned.step == .length)
+
+    // Stepping repeatedly: every click reassigns, so the unit survives all of
+    // them — this is the sequence that used to decay after the first click.
+    var range = month
+    var step = monthStep
+    for _ in 1...4 {
+        range = StatsRange.shifted(step: step, from: range.from, to: range.to, by: 1, calendar: cal)
+        let after = StatsRange.afterDateChange(
+            preset: .custom, step: step, from: range.from, to: range.to,
+            lastAssigned: range, today: today, firstSpanStart: nil, calendar: cal)
+        step = after.step
+    }
+    check("four steps in a row all keep the month unit", step == .month)
+    check("and they end on a month boundary", range.from == day(2027, 1, 1), "got \(range.from)")
+}
+
+check("this week ends today, not on Saturday",
+      StatsRange.dates(for: .thisWeek, today: today, firstSpanStart: nil, calendar: cal)!.to == today)
+
+// Boundary days: `today` landing exactly on a unit's own first day. The
+// `min(today, interval.end - 1)` clamp has to resolve to `today` here too,
+// not to the far end of a range that hasn't happened yet.
+do {
+    // 2026-09-13 is a Sunday — the calendar's own firstWeekday (1) — so "this
+    // week" starting there is the firstWeekday edge, not just any week start.
+    let sunday = day(2026, 9, 13)
+    check("this week starting on its own first day (a Sunday) is just today",
+          StatsRange.dates(for: .thisWeek, today: sunday, firstSpanStart: nil, calendar: cal)! == (sunday, sunday))
+}
+
+do {
+    let firstOfMonth = day(2026, 9, 1)
+    check("this month starting on the 1st is just today",
+          StatsRange.dates(for: .thisMonth, today: firstOfMonth, firstSpanStart: nil, calendar: cal)!
+            == (firstOfMonth, firstOfMonth))
+}
+
+do {
+    let newYearsDay = day(2026, 1, 1)
+    check("year to date on Jan 1 is just today",
+          StatsRange.dates(for: .yearToDate, today: newYearsDay, firstSpanStart: nil, calendar: cal)!
+            == (newYearsDay, newYearsDay))
+}
+
+// ----------------------------------------------------------------- chart hour
+
+// Dates here go through Format.dayKey, which uses the machine's timezone, so
+// derive the key from the date rather than hard-coding one.
+do {
+    let cur = Calendar.current
+    let start = cur.startOfDay(for: Date(timeIntervalSince1970: 1_789_000_000))
+    let key = Format.dayKey.string(from: start)
+    let nextMidnight = cur.date(byAdding: .day, value: 1, to: start)!
+
+    check("start of the day is hour 0", hourOfDay(start, dayKey: key) == 0)
+    check("midday is hour 12", hourOfDay(start.addingTimeInterval(12 * 3600), dayKey: key) == 12)
+
+    // dayStats() clamps a span crossing midnight to the next midnight and files
+    // it under the day it began on. Read against its own day that instant is
+    // hour 0, which drew a five-minute span as a near-full-height bar.
+    check("the following midnight is hour 24 of the day it closes",
+          hourOfDay(nextMidnight, dayKey: key) == 24,
+          "got \(hourOfDay(nextMidnight, dayKey: key))")
+
+    let barHeight = hourOfDay(nextMidnight, dayKey: key)
+        - hourOfDay(nextMidnight.addingTimeInterval(-300), dayKey: key)
+    check("a 23:55–00:00 span is five minutes tall",
+          abs(barHeight - 5.0 / 60) < 1e-9, "got \(barHeight) hours")
+
+    check("an instant past the day is clamped to 24",
+          hourOfDay(nextMidnight.addingTimeInterval(3600), dayKey: key) == 24)
+    check("an unparseable day key falls back to the date's own day",
+          hourOfDay(start.addingTimeInterval(3600), dayKey: "not-a-day") == 1)
+}
+
+// DST, hermetically: `hourOfDay` takes a calendar, so the transition days can be
+// stated outright rather than depending on where this machine happens to be.
+// America/New_York has both kinds — 2026-03-08 is 23 hours, 2026-11-01 is 25.
+//
+// The bug this guards: measuring elapsed seconds since midnight instead of
+// reading the clock. On those days the two disagree by an hour, so every bar
+// landed a gridline off the wall-clock hour the Y axis is labelled with — and on
+// the 25-hour day the 24 ceiling saturated from 23:00 on, flattening the very
+// 23:55→00:00 sliver this whole helper exists to draw.
+let ny: Calendar = {
+    var c = Calendar(identifier: .gregorian)
+    c.timeZone = TimeZone(identifier: "America/New_York")!
+    return c
+}()
+
+/// Wall-clock instant in New York. `DateComponents` resolves the repeated hour
+/// on a fall-back day to the first (still daylight-saving) occurrence.
+func nyAt(_ y: Int, _ m: Int, _ d: Int, _ hh: Int, _ mm: Int = 0) -> Date {
+    ny.date(from: DateComponents(year: y, month: m, day: d, hour: hh, minute: mm))!
+}
+
+for (label, key, y, m, d) in [("spring forward", "2026-03-08", 2026, 3, 8),
+                              ("fall back", "2026-11-01", 2026, 11, 1)] {
+    check("\(label): 09:00 reads as hour 9",
+          hourOfDay(nyAt(y, m, d, 9), dayKey: key, calendar: ny) == 9,
+          "got \(hourOfDay(nyAt(y, m, d, 9), dayKey: key, calendar: ny))")
+    check("\(label): 14:00 reads as hour 14",
+          hourOfDay(nyAt(y, m, d, 14), dayKey: key, calendar: ny) == 14,
+          "got \(hourOfDay(nyAt(y, m, d, 14), dayKey: key, calendar: ny))")
+    check("\(label): 23:00 reads as hour 23",
+          hourOfDay(nyAt(y, m, d, 23), dayKey: key, calendar: ny) == 23,
+          "got \(hourOfDay(nyAt(y, m, d, 23), dayKey: key, calendar: ny))")
+    check("\(label): the day opens at hour 0",
+          hourOfDay(nyAt(y, m, d, 0), dayKey: key, calendar: ny) == 0)
+
+    // The day's own closing midnight, however many hours away it actually is.
+    let closing = ny.date(byAdding: .day, value: 1, to: ny.startOfDay(for: nyAt(y, m, d, 12)))!
+    check("\(label): the closing midnight is hour 24",
+          hourOfDay(closing, dayKey: key, calendar: ny) == 24,
+          "got \(hourOfDay(closing, dayKey: key, calendar: ny))")
+
+    let bar = hourOfDay(closing, dayKey: key, calendar: ny)
+        - hourOfDay(closing.addingTimeInterval(-300), dayKey: key, calendar: ny)
+    check("\(label): a 23:55–00:00 span is still five minutes tall",
+          abs(bar - 5.0 / 60) < 1e-9, "got \(bar) hours")
+}
+
+// The keys the app stores come out of `Format.dayKey`, which has no fixed
+// locale, so under a non-Latin numbering system it writes digits the ASCII hand
+// parser can't read (`ar_EG` gives ٢٠٢٦-٠٩-١٦). When that parse fails silently
+// `hourOfDay` falls back to the timestamp's own day — the original bug, restored
+// for exactly those users. The formatter that wrote the key has to be able to
+// read it back. Locale is swapped on the shared formatter and put back after.
+do {
+    let cur = Calendar.current
+    let start = cur.startOfDay(for: Date(timeIntervalSince1970: 1_789_000_000))
+    let nextMidnight = cur.date(byAdding: .day, value: 1, to: start)!
+
+    let savedLocale = Format.dayKey.locale
+    let originalKey = Format.dayKey.string(from: start)
+
+    Format.dayKey.locale = Locale(identifier: "ar_EG")
+    let key = Format.dayKey.string(from: start)
+    let isNonASCII = !key.allSatisfy { $0.isASCII }
+
+    // Guard the guard: if this CLT's ICU data ever emits Latin digits for ar_EG
+    // the checks below would pass without exercising anything.
+    check("ar_EG really does write a non-ASCII day key", isNonASCII, "key was \(key)")
+
+    check("a non-Latin-digit key still closes at hour 24",
+          hourOfDay(nextMidnight, dayKey: key, calendar: cur) == 24,
+          "key \(key) gave \(hourOfDay(nextMidnight, dayKey: key, calendar: cur))")
+
+    let bar = hourOfDay(nextMidnight, dayKey: key, calendar: cur)
+        - hourOfDay(nextMidnight.addingTimeInterval(-300), dayKey: key, calendar: cur)
+    check("a non-Latin-digit key still draws a five-minute 23:55–00:00 bar",
+          abs(bar - 5.0 / 60) < 1e-9, "got \(bar) hours")
+
+    check("a non-Latin-digit key still opens at hour 0",
+          hourOfDay(start, dayKey: key, calendar: cur) == 0)
+
+    Format.dayKey.locale = savedLocale
+
+    // …and the swap really was undone, or every later check runs on a formatter
+    // this block left behind. Checked by what the formatter writes, not by what
+    // its `locale` property reads back: on a host whose own locale uses a
+    // non-Latin numbering system, "is it ASCII" is the wrong answer, and a
+    // saved-then-reassigned `Locale` doesn't reliably compare equal to itself
+    // either. What has to hold is that the formatter behaves as it did before.
+    check("the shared formatter writes what it wrote before the swap",
+          Format.dayKey.string(from: start) == originalKey,
+          "was \(originalKey), now \(Format.dayKey.string(from: start))")
+}
+
+// The transition days really are 23 and 25 hours long — if they weren't, the
+// checks above would pass for the wrong reason.
+check("the spring-forward day is 23 hours long",
+      ny.date(byAdding: .day, value: 1, to: nyAt(2026, 3, 8, 0))!
+        .timeIntervalSince(nyAt(2026, 3, 8, 0)) == 23 * 3600)
+check("the fall-back day is 25 hours long",
+      ny.date(byAdding: .day, value: 1, to: nyAt(2026, 11, 1, 0))!
+        .timeIntervalSince(nyAt(2026, 11, 1, 0)) == 25 * 3600)
+
+// ------------------------------------------------------------------- report
+
+if failures.isEmpty {
+    print("ok — \(checks) checks passed")
+} else {
+    for f in failures { FileHandle.standardError.write(Data("FAIL: \(f)\n".utf8)) }
+    FileHandle.standardError.write(Data("\(failures.count) of \(checks) checks failed\n".utf8))
+    exit(1)
+}

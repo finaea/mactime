@@ -97,10 +97,15 @@ Needs only Command Line Tools (no Xcode): Swift 6.1+, macOS 15 SDK.
 
 ```bash
 swift build                      # compile
+tools/run-tests.sh               # checks for the date math (Tests/)
 tools/bundle-macos.sh            # build + assemble publish/MacTime.app + sign
 swift tools/make-icons.swift     # regenerate icns + dmg artwork
 tools/make-dmg.sh                # package the dmg
 ```
+
+The checks are a plain executable rather than a SwiftPM test target so they remain
+runnable on Command Line Tools installations where the missing SwiftUI macro
+plugin prevents `swift test` from building the app target.
 
 Signing: run `tools/make-dev-identity.sh` once (on the machine, not over ssh)
 to create a stable self-signed identity — otherwise builds are ad-hoc signed

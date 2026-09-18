@@ -10,9 +10,15 @@ final class ScreenshotService {
     private var timer: Timer?
     private var lastCaptureAt: Date?
     private var capturing = false
+    private var captureTask: Task<Void, Never>?
     private let encodeQueue = DispatchQueue(label: "mactime.screenshot.encode", qos: .utility)
 
-    var isPaused = false
+    /// Pausing has to reach the round already in flight, not just the next one:
+    /// a capture started a moment earlier would otherwise still land on disk
+    /// (and in the database) seconds after the user asked us to stop.
+    var isPaused = false {
+        didSet { if isPaused { captureTask?.cancel() } }
+    }
 
     init(store: Store) {
         self.store = store
@@ -35,6 +41,7 @@ final class ScreenshotService {
     func stop() {
         timer?.invalidate()
         timer = nil
+        captureTask?.cancel()
     }
 
     private func tick() {
@@ -47,7 +54,7 @@ final class ScreenshotService {
         }
         lastCaptureAt = now
         capturing = true
-        Task { @MainActor in
+        captureTask = Task { @MainActor in
             await self.captureRound(at: now)
             self.capturing = false
         }
@@ -96,12 +103,14 @@ final class ScreenshotService {
     private func captureRound(at ts: Date) async {
         do {
             let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+            guard shouldKeepCapturing else { return }
             let day = Format.dayKey.string(from: ts)
             let dayDir = store.screenshotsDir.appendingPathComponent(day, isDirectory: true)
             try FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
             let activeID = Self.activeDisplayID()
 
             for display in content.displays {
+                guard shouldKeepCapturing else { return }
                 let filter = SCContentFilter(display: display, excludingWindows: [])
                 let config = SCStreamConfiguration()
                 let scale = CGFloat(filter.pointPixelScale)
@@ -109,12 +118,23 @@ final class ScreenshotService {
                 config.height = Int(filter.contentRect.height * scale)
                 config.showsCursor = true
                 let image = try await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
+                // `save` is the commit point — past it the encode queue writes
+                // files and a row regardless — so this is the last chance to
+                // honor a pause that arrived mid-round.
+                guard shouldKeepCapturing else { return }
                 save(image, displayID: Int(display.displayID), at: ts, day: day, dayDir: dayDir,
                      isActive: display.displayID == activeID)
             }
         } catch {
             NSLog("MacTime: screenshot round failed (will retry): %@", "\(error)")
         }
+    }
+
+    /// Re-read between the awaits of a round: pause cancels the task, and
+    /// Settings can be switched off while a round is still in the air.
+    @MainActor
+    private var shouldKeepCapturing: Bool {
+        !Task.isCancelled && !isPaused && Settings.screenshotsEnabled
     }
 
     private func save(_ image: CGImage, displayID: Int, at ts: Date, day: String, dayDir: URL,

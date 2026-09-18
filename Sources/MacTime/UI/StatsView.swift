@@ -7,17 +7,7 @@ import Charts
 struct StatsView: View {
     let store: Store
 
-    enum Preset: String, CaseIterable {
-        case today = "Today"
-        case yesterday = "Yesterday"
-        case thisWeek = "This week"
-        case previousWeek = "Previous week"
-        case thisMonth = "This month"
-        case previousMonth = "Previous month"
-        case yearToDate = "Year to date"
-        case allTime = "All time"
-        case custom = "Custom"
-    }
+    typealias Preset = StatsRange.Preset
 
     enum SubTab: String, CaseIterable {
         case dayDuration = "Day duration"
@@ -27,6 +17,15 @@ struct StatsView: View {
     }
 
     @State private var preset: Preset = .thisWeek
+    /// What Next/Previous walks by. Held apart from `preset` because stepping
+    /// turns the range into a Custom one while the unit it walks in should
+    /// survive — `apply(preset:)` sets this, `shift()` only reads it.
+    @State private var step: StatsRange.Step = StatsRange.step(for: .thisWeek)
+    /// The last From/To this view assigned itself — by choosing a preset or by
+    /// stepping. The pickers report those assignments exactly as they report a
+    /// hand edit, so this is what tells the two apart once `preset` has already
+    /// become Custom and `matches` can no longer answer.
+    @State private var assignedRange: (from: Date, to: Date)?
     @State private var fromDate = Calendar.current.startOfDay(for: Date())
     @State private var toDate = Date()
     @State private var subTab: SubTab = .dayDuration
@@ -108,70 +107,54 @@ struct StatsView: View {
         return (from, to)
     }
 
+    /// Only "All time" depends on the store, so the query stays off the path
+    /// every other preset takes.
+    private func firstSpanStart(for p: Preset) -> Date? {
+        p == .allTime ? store.firstSpanStart() : nil
+    }
+
     private func apply(preset p: Preset) {
-        let cal = Calendar.current
-        let today = cal.startOfDay(for: Date())
-        switch p {
-        case .today:
-            fromDate = today; toDate = today
-        case .yesterday:
-            let y = cal.date(byAdding: .day, value: -1, to: today)!
-            fromDate = y; toDate = y
-        case .thisWeek:
-            let interval = cal.dateInterval(of: .weekOfYear, for: today)!
-            fromDate = interval.start
-            toDate = min(today, interval.end.addingTimeInterval(-1))
-        case .previousWeek:
-            let thisWeek = cal.dateInterval(of: .weekOfYear, for: today)!
-            fromDate = cal.date(byAdding: .weekOfYear, value: -1, to: thisWeek.start)!
-            toDate = thisWeek.start.addingTimeInterval(-1)
-        case .thisMonth:
-            let interval = cal.dateInterval(of: .month, for: today)!
-            fromDate = interval.start
-            toDate = min(today, interval.end.addingTimeInterval(-1))
-        case .previousMonth:
-            let thisMonth = cal.dateInterval(of: .month, for: today)!
-            fromDate = cal.date(byAdding: .month, value: -1, to: thisMonth.start)!
-            toDate = thisMonth.start.addingTimeInterval(-1)
-        case .yearToDate:
-            fromDate = cal.dateInterval(of: .year, for: today)!.start
-            toDate = today
-        case .allTime:
-            fromDate = store.firstSpanStart() ?? today
-            toDate = today
-        case .custom:
-            break
+        // Custom is where stepping lands the range, not a unit of its own, so it
+        // leaves `step` holding whatever the last real preset chose.
+        if p != .custom { step = StatsRange.step(for: p) }
+        if let range = StatsRange.dates(for: p, today: Date(),
+                                        firstSpanStart: firstSpanStart(for: p)) {
+            fromDate = range.from
+            toDate = range.to
+            assignedRange = range
         }
         reload()
     }
 
+    /// Runs on every From/To change — the view's own assignments included, since
+    /// the pickers can't tell those from a hand edit. `afterDateChange` decides
+    /// both questions from values.
+    ///
+    /// Assigning the results back is a no-op whenever nothing changed, which is
+    /// the common path. A demotion does re-enter `apply(.custom)` through
+    /// `onChange(of: preset)`, once: `afterDateChange` can only return the preset
+    /// unchanged or `.custom`, so there is no second hop. That re-entry is
+    /// harmless because `apply` guards both of its mutations for Custom — the
+    /// `p != .custom` check on `step`, and `dates(for: .custom)` returning nil —
+    /// which is what those guards are for, rather than defensiveness.
     private func userEditedDates() {
-        if preset != .custom { preset = .custom }
+        let next = StatsRange.afterDateChange(
+            preset: preset, step: step, from: fromDate, to: toDate,
+            lastAssigned: assignedRange, today: Date(),
+            firstSpanStart: firstSpanStart(for: preset))
+        preset = next.preset
+        step = next.step
         reload()
     }
 
     private func shift(_ direction: Int) {
-        let cal = Calendar.current
-        switch preset {
-        case .today, .yesterday:
-            fromDate = cal.date(byAdding: .day, value: direction, to: fromDate)!
-            toDate = fromDate
-            preset = .custom
-        case .thisWeek, .previousWeek:
-            fromDate = cal.date(byAdding: .weekOfYear, value: direction, to: fromDate)!
-            toDate = cal.date(byAdding: .day, value: 6, to: fromDate)!
-            preset = .custom
-        case .thisMonth, .previousMonth:
-            fromDate = cal.date(byAdding: .month, value: direction, to: fromDate)!
-            let interval = cal.dateInterval(of: .month, for: fromDate)!
-            toDate = interval.end.addingTimeInterval(-1)
-            preset = .custom
-        default:
-            let days = max(1, cal.dateComponents([.day], from: fromDate, to: toDate).day ?? 1)
-            fromDate = cal.date(byAdding: .day, value: direction * days, to: fromDate)!
-            toDate = cal.date(byAdding: .day, value: direction * days, to: toDate)!
-            preset = .custom
-        }
+        let range = StatsRange.shifted(step: step, from: fromDate, to: toDate, by: direction)
+        fromDate = range.from
+        toDate = range.to
+        assignedRange = range
+        // The range is no longer the preset it came from, and the picker should
+        // say so — but `step` stays, so the next click walks the same unit.
+        preset = .custom
         reload()
     }
 
@@ -551,11 +534,6 @@ struct AttendanceView: View {
 }
 
 // ================================================================ shared helpers
-
-private func hourOfDay(_ date: Date, dayKey: String) -> Double {
-    let dayStart = Calendar.current.startOfDay(for: date)
-    return min(24, max(0, date.timeIntervalSince(dayStart) / 3600))
-}
 
 private func hourLabel(_ hour: Double) -> String {
     let h = Int(hour.rounded())
