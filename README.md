@@ -106,19 +106,37 @@ launch.
 
 ## Building from source
 
-Needs only Command Line Tools (no Xcode): Swift 6.1+, macOS 15 SDK.
+Swift 6.1+, macOS 15 SDK.
 
 ```bash
-swift build                      # compile
+swift build                      # compile          (needs Xcode — see below)
+tools/typecheck.sh               # type-check everything, SwiftUI included
 tools/run-tests.sh               # checks for the date math and the store (Tests/)
 tools/bundle-macos.sh            # build + assemble publish/MacTime.app + sign
 swift tools/make-icons.swift     # regenerate icns + dmg artwork
 tools/make-dmg.sh                # package the dmg
 ```
 
-The checks are a plain executable rather than a SwiftPM test target so they remain
-runnable on Command Line Tools installations where the missing SwiftUI macro
-plugin prevents `swift test` from building the app target.
+**Compiling needs Xcode, not just the Command Line Tools.** SwiftUI's `@State`
+is a macro, and the `SwiftUIMacros` plugin that expands it ships with Xcode —
+it is not in the Command Line Tools (verified absent on CLT 27.0.0). Without it
+every `@State` fails before the type checker reads any of your code, so
+`swift build`, `swift test` and `tools/bundle-macos.sh` all fail with hundreds
+of errors that have nothing to do with the change you just made.
+
+The two scripts work regardless, and on a CLT-only machine they are the whole
+verification story:
+
+- `tools/typecheck.sh` type-checks the entire app, SwiftUI views included, by
+  swapping `@State` for an equivalent property wrapper in a throwaway copy of
+  the tree (`State()` is the only macro this app uses). It catches real type
+  errors in `UI/*.swift` and reports them against the real source paths. It
+  type-checks only — it doesn't produce a binary.
+- `tools/run-tests.sh` compiles the checks in `Tests/` into a plain executable
+  rather than a SwiftPM test target, for the same reason: `swift test` would
+  build the app target and hit the same wall. It can only take SwiftUI-free
+  sources, which is why the date math, day-key rules and store live in files
+  that import at most AppKit.
 
 Signing: run `tools/make-dev-identity.sh` once (on the machine, not over ssh)
 to create a stable self-signed identity — otherwise builds are ad-hoc signed
@@ -133,7 +151,7 @@ Sources/MacTime/
 ├── Store/       sqlite3 wrapper + queries (spans, screenshots, day stats)
 ├── UI/          DayView (timeline/viewer/zoom), StatsView (4 charts), Settings
 └── Support/     settings, formatters, app colors, image cache
-tools/           bundle, dmg, icon generation, signing identity
+tools/           typecheck, tests, bundle, dmg, icon generation, signing identity
 ```
 
 ## License
