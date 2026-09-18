@@ -30,6 +30,7 @@ swiftc -swift-version 5 -target arm64-apple-macos15.0 \
     Sources/MacTime/Support/URLPolicy.swift \
     Sources/MacTime/Support/CapturePolicy.swift \
     Sources/MacTime/Support/CaptureSuspension.swift \
+    Sources/MacTime/Support/AppLock.swift \
     Sources/MacTime/Support/Settings.swift \
     Sources/MacTime/Support/TimeMath.swift \
     Sources/MacTime/Support/ImageCache.swift \

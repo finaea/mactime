@@ -13,6 +13,7 @@ struct SettingsView: View {
     @AppStorage(Settings.Key.screenshotIntervalSeconds) private var screenshotIntervalSeconds = 15.0
     @AppStorage(Settings.Key.screenshotRetentionDays) private var screenshotRetentionDays = 14
     @AppStorage(Settings.Key.screenshotQuality) private var screenshotQuality = 0.6
+    @AppStorage(Settings.Key.requireAuthentication) private var requireAuthentication = false
     @AppStorage(Settings.Key.showAllDisplays) private var showAllDisplays = false
     @AppStorage(Settings.Key.hoverPreviewOffsetX) private var hoverPreviewOffsetX = -8.0
     @AppStorage(Settings.Key.hoverPreviewOffsetY) private var hoverPreviewOffsetY = -8.0
@@ -136,6 +137,7 @@ struct SettingsView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([store.dataDir])
                 }
                 encryptionStatus
+                appLock
             }
 
             deleteSection
@@ -267,7 +269,7 @@ struct SettingsView: View {
         addExclusion(app.bundleID)
     }
 
-    // ------------------------------------------------------------- encryption
+    // ------------------------------------------------- encryption and locking
 
     /// Said in Settings and not only as a chip in the day view, because this is
     /// where someone goes to find out what is on their disk. It also quietly
@@ -293,6 +295,21 @@ struct SettingsView: View {
                     .foregroundStyle(.orange)
                 Text(why).font(.caption).foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// Kept next to the encryption line above precisely so the two can't be
+    /// read as the same promise. One stops a person; the other stops a process.
+    @ViewBuilder
+    private var appLock: some View {
+        Toggle("Require Touch ID or password to open MacTime", isOn: $requireAuthentication)
+        Text("Asks before the MacTime window or these settings will open, so someone sitting at your unlocked Mac can't click the menu bar icon and scroll through your history. It stops a person using the app; it does nothing about a program reading the files, which is what the encryption above is for. Either way it never changes what is being recorded.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        if requireAuthentication && !AppLock.isAvailable {
+            Text("This Mac has no login password set, so there is nothing for MacTime to check and it will open without asking.")
+                .font(.caption)
+                .foregroundStyle(.orange)
         }
     }
 

@@ -12,6 +12,7 @@ enum Settings {
         d.register(defaults: [
             Key.trackingEnabled: true,
             Key.paused: false,
+            Key.requireAuthentication: false,
             Key.browserTrackingEnabled: true,
             Key.captureFullURLs: false,
             Key.excludedBundleIDs: [String](),
@@ -43,6 +44,10 @@ enum Settings {
         /// call, reboot an hour later, and you are being recorded again with
         /// nothing anywhere saying so.
         static let paused = "paused"
+        /// Ask for Touch ID or the login password before any MacTime window
+        /// opens. Off by default — it gates *viewing*, never recording, and
+        /// most people don't want a fingerprint between them and their own day.
+        static let requireAuthentication = "requireAuthentication"
         static let browserTrackingEnabled = "browserTrackingEnabled"
         /// false — keep only a URL's origin (`https://mail.google.com`).
         /// true  — keep the whole thing, query string included. Opt-in, and off
@@ -69,6 +74,7 @@ enum Settings {
     static var paused: Bool { d.bool(forKey: Key.paused) }
     static func setPaused(_ paused: Bool) { d.set(paused, forKey: Key.paused) }
 
+    static var requireAuthentication: Bool { d.bool(forKey: Key.requireAuthentication) }
     static var browserTrackingEnabled: Bool { d.bool(forKey: Key.browserTrackingEnabled) }
     static var captureFullURLs: Bool { d.bool(forKey: Key.captureFullURLs) }
 

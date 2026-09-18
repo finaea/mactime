@@ -170,7 +170,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // ------------------------------------------------------------- windows
 
+    /// True while the lock's prompt is up, so hammering the menu item can't
+    /// stack a second one behind the first.
+    private var authenticating = false
+
+    /// Whether the app is already open, which is also what decides whether the
+    /// lock asks. App-wide and not per-window on purpose: getting past the lock
+    /// admits you to MacTime, so crossing from the window to Settings is not a
+    /// second opening — and gating them separately would have made Settings the
+    /// bypass anyway (open it, switch the lock off, open the window).
+    private var hasVisibleWindow: Bool {
+        (mainWindow?.isVisible ?? false) || (settingsWindow?.isVisible ?? false)
+    }
+
+    /// Every path that opens a window runs through here. Nothing about
+    /// recording is downstream of it: a failed or cancelled prompt leaves the
+    /// user tracked exactly as they asked to be, and only stops them looking.
+    private func unlocked(_ present: @escaping () -> Void) {
+        guard !authenticating else { return }
+        AppLock.gate(
+            enabled: Settings.requireAuthentication,
+            alreadyVisible: hasVisibleWindow,
+            authenticate: { [weak self] done in
+                self?.authenticating = true
+                AppLock.authenticate(reason: "open your activity history") { authenticated in
+                    self?.authenticating = false
+                    done(authenticated)
+                }
+            },
+            present: present)
+    }
+
     func showMainWindow() {
+        unlocked { [weak self] in self?.presentMainWindow() }
+    }
+
+    private func presentMainWindow() {
         if mainWindow == nil {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 1280, height: 800),
@@ -197,14 +232,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) { _ in
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
-                let anyVisible = (self.mainWindow?.isVisible ?? false)
-                    || (self.settingsWindow?.isVisible ?? false)
-                if !anyVisible { NSApp.setActivationPolicy(.accessory) }
+                if !self.hasVisibleWindow { NSApp.setActivationPolicy(.accessory) }
             }
         }
     }
 
     @objc func openSettings() {
+        unlocked { [weak self] in self?.presentSettingsWindow() }
+    }
+
+    private func presentSettingsWindow() {
         if settingsWindow == nil {
             let window = NSWindow(
                 contentRect: NSRect(x: 0, y: 0, width: 500, height: 560),
