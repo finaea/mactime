@@ -184,6 +184,26 @@ final class Crypto: Sendable {
                         create: () -> Lookup) -> Crypto {
         let checkFile = dataDir.appendingPathComponent(checkFileName)
         let check = try? Data(contentsOf: checkFile)
+        // *Present but unreadable* is not *absent*, and `try?` alone cannot tell
+        // them apart. Treating the first as the second minted a fresh key over a
+        // store already sealed under another one and then wrote the new
+        // sentinel over the old by atomic rename — which needs no permission on
+        // the file it replaces — destroying the only evidence the store had ever
+        // been sealed. Capture carried on, no chip appeared, and every capture,
+        // title and URL was permanently unreadable while the app looked well.
+        // A restore is exactly where modes and ownership get mangled, and a
+        // restore is the scenario this interlock exists for.
+        let checkUnreadable = check == nil && FileManager.default.fileExists(atPath: checkFile.path)
+        guard !checkUnreadable else {
+            // Deliberately ahead of `lookup()`: it holds whichever key the
+            // keychain has, and the point is that we cannot check it against
+            // anything. Recoverable — fix the permissions and reopen — which
+            // minting is not.
+            return Crypto(unavailable:
+                "MacTime's key-check file is there but can't be read, so it can't tell whether "
+                + "the data key is the right one. Nothing is being recorded and nothing has been "
+                + "deleted — a permissions problem on the MacTime folder is the usual cause.")
+        }
 
         switch lookup() {
         case .found(let key):
