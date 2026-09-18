@@ -43,11 +43,14 @@ enum Erase {
     /// Erase `contents` in [from, to); a nil bound is unbounded, so nil/nil is
     /// "delete all data".
     ///
-    /// Unlinks each capture's files before deleting its row, so a crash in
-    /// between leaves rows that still name whatever survived and re-running
-    /// finishes the job. The other order strands those files with nothing left
-    /// pointing at them — an orphan no later sweep can find, which is the
-    /// unbounded-retention failure this whole change exists to close.
+    /// Unlinks each capture's files before deleting its row, and deletes only
+    /// the rows whose files actually went. The ordering survives a crash — the
+    /// rows left still name whatever survived, so re-running finishes the job —
+    /// and the `removed` list survives the case the ordering alone does not: a
+    /// single file that refuses to unlink. Deleting its row anyway would strand
+    /// the file with nothing left pointing at it, where no later sweep or erase
+    /// could ever reach it. A row that outlives its file is harmless and
+    /// self-healing; the reverse is the orphan this ordering exists to prevent.
     ///
     /// Only the database work is main-thread; unlinking a day is hundreds of
     /// files and an erase-everything is tens of thousands.
@@ -74,28 +77,43 @@ enum Erase {
         let keyCheck = store.dataDir.appendingPathComponent(Crypto.checkFileName)
 
         var screenshots = 0, failed = 0
-        // Collect, unlink, then delete exactly what was collected — and go
-        // round for whatever landed in between. The suspension above stops new
-        // rounds and turns back any round that hasn't reached its commit point,
-        // which leaves one case: a capture already past that point, with its
-        // bytes on the encode queue and its row not yet inserted. So the loop
-        // stays. It is bounded rather than run to a fixed point because a
-        // capture arriving after the last pass belongs to the next erase, not
-        // to an infinite loop.
+        // Collect, unlink, then delete exactly what went — and go round for
+        // whatever landed in between. The suspension above stops new rounds and
+        // turns back any round that hasn't reached its commit point, which
+        // leaves one case: a capture already past that point, with its bytes on
+        // the encode queue and its row not yet inserted. So the loop stays. It
+        // is bounded rather than run to a fixed point because a capture
+        // arriving after the last pass belongs to the next erase, not to an
+        // infinite loop.
+        //
+        // Each capture is attempted at most once. The later passes are for
+        // captures that arrived while we worked, never for retrying a file that
+        // would not unlink: its row is still there, so it would come back
+        // through `screenshotRows` every pass and be counted as a fresh failure
+        // each time — one stuck file reported to the user as three.
+        var attempted = Set<Int64>()
         for _ in 0..<3 {
-            let rows = store.screenshotRows(from: from, to: to)
+            let rows = store.screenshotRows(from: from, to: to).filter { !attempted.contains($0.id) }
             if rows.isEmpty { break }
-            let files = rows.map { (path: $0.path, thumb: $0.thumbPath) }
-            failed += await Task.detached(priority: .utility) {
+            attempted.formUnion(rows.map { $0.id })
+            let files = rows.map { (id: $0.id, path: $0.path, thumb: $0.thumbPath) }
+            let swept = await Task.detached(priority: .utility) {
+                var removed: [Int64] = []
                 var failed = 0
                 for file in files {
+                    var gone = true
                     for path in [file.path, file.thumb] where !path.isEmpty {
-                        if !remove(path) { failed += 1 }
+                        if !remove(path) {
+                            failed += 1
+                            gone = false
+                        }
                     }
+                    if gone { removed.append(file.id) }
                 }
-                return failed
+                return (removed: removed, failed: failed)
             }.value
-            screenshots += store.deleteScreenshots(ids: rows.map { $0.id })
+            failed += swept.failed
+            screenshots += store.deleteScreenshots(ids: swept.removed)
         }
         // Retention deletes captures and stops. See `Contents`.
         let spans = contents == .capturesAndActivity ? store.deleteSpans(from: from, to: to) : 0
