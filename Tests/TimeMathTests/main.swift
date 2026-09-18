@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 // Checks for the pure date math in Sources/MacTime/Support/TimeMath.swift.
@@ -859,6 +860,722 @@ await { () async -> Void in
 
     store.close()
 }()
+
+// ============================================================================
+// Encryption at rest — Crypto, Rewrap, and Store's encrypted columns.
+//
+// DataKeychain.swift is compiled by tools/run-tests.sh but never called here:
+// every Crypto below is built from a throwaway `SymmetricKey`, and every
+// `Store` below is opened with an explicit directory *and* an explicit
+// `crypto:`, never the login keychain. A check run must not read — and must
+// certainly not create — the key the user's real store is sealed with.
+// ============================================================================
+
+func randomKey() -> SymmetricKey { SymmetricKey(size: .bits256) }
+
+/// Write a title/URL straight into `activity_spans` as TEXT, bypassing
+/// `Store.insertSpan` (which always seals). This is how a pre-encryption row
+/// is recreated for the migration checks below — opening a second connection
+/// to the same file is exactly what `Rewrap` itself contends with while it's
+/// running.
+@discardableResult
+func insertPlaintextSpan(dbPath: String, start: Date, end: Date, bundleId: String, appName: String,
+                         title: String?, url: String?, kind: SpanKind) -> Int64 {
+    let db = Database(path: dbPath)
+    db.run("""
+    INSERT INTO activity_spans (start, end, app_bundle_id, app_name, window_title, url, kind)
+    VALUES (?,?,?,?,?,?,?)
+    """, bind: [start.timeIntervalSince1970, end.timeIntervalSince1970,
+                bundleId, appName, title, url, kind.rawValue])
+    let id = db.lastInsertId
+    db.close()
+    return id
+}
+
+func containsBytes(_ haystack: Data, _ needle: String) -> Bool {
+    haystack.range(of: Data(needle.utf8)) != nil
+}
+
+// -------------------------------------------------------- seal/open round-trip
+
+do {
+    let crypto = Crypto(key: randomKey())
+
+    let large = Data((0..<200_000).map { UInt8($0 % 256) })
+    check("a large payload round-trips through seal/open",
+          (try? crypto.open(crypto.seal(large))) == large)
+
+    let tiny = Data([0x2A])
+    check("a one-byte payload round-trips through seal/open",
+          (try? crypto.open(crypto.seal(tiny))) == tiny)
+
+    let empty = Data()
+    check("an empty payload round-trips through seal/open",
+          (try? crypto.open(crypto.seal(empty))) == empty)
+}
+
+// ------------------------------------------------------------ tamper detection
+
+do {
+    let crypto = Crypto(key: randomKey())
+    let sealed = try! crypto.seal(Data("hello, MacTime".utf8))
+    // magic(4) + nonce(12) + ciphertext(14) + tag(16) = 46 bytes.
+
+    func flip(_ data: Data, at offset: Int) -> Data {
+        var copy = data
+        copy[copy.startIndex + offset] ^= 0xFF
+        return copy
+    }
+
+    enum Outcome: Equatable { case corrupt, notSealed, other }
+    func open(_ crypto: Crypto, _ data: Data) -> Outcome {
+        do { _ = try crypto.open(data); return .other }
+        catch Crypto.Failure.corrupt { return .corrupt }
+        catch Crypto.Failure.notSealed { return .notSealed }
+        catch { return .other }
+    }
+
+    // The magic is also `isSealed`'s format check, so a flipped magic byte is
+    // turned away as "not one of ours" (.notSealed) rather than "ours but
+    // tampered" (.corrupt) — see the report back to the assigning agent. It
+    // still never opens to garbage, which is the property that actually
+    // matters here.
+    check("flipping a byte in the magic is rejected rather than opened",
+          open(crypto, flip(sealed, at: 0)) != .other,
+          "got \(open(crypto, flip(sealed, at: 0)))")
+
+    check("flipping a byte in the nonce is detected as corrupt",
+          open(crypto, flip(sealed, at: 4)) == .corrupt)
+    check("flipping a byte in the ciphertext body is detected as corrupt",
+          open(crypto, flip(sealed, at: 4 + 12 + 1)) == .corrupt)
+    check("flipping a byte in the trailing tag is detected as corrupt",
+          open(crypto, flip(sealed, at: sealed.count - 1)) == .corrupt)
+    check("a truncated sealed value is detected as corrupt, not silently shortened",
+          open(crypto, sealed.dropLast(5)) == .corrupt)
+
+    let otherKey = Crypto(key: randomKey())
+    check("opening with a different key is detected as corrupt",
+          open(otherKey, sealed) == .corrupt)
+}
+
+// -------------------------------------------------------------- nonce freshness
+
+do {
+    let crypto = Crypto(key: randomKey())
+    let plaintext = Data("the same value, twice".utf8)
+    let a = try! crypto.seal(plaintext)
+    let b = try! crypto.seal(plaintext)
+    check("sealing the same plaintext twice yields different bytes (fresh nonce per value)",
+          a != b)
+    check("both still open back to the original plaintext",
+          (try? crypto.open(a)) == plaintext && (try? crypto.open(b)) == plaintext)
+}
+
+// -------------------------------------------------------- mixed-format read path
+
+do {
+    let crypto = Crypto(key: randomKey())
+    let jpeg = Data([0xFF, 0xD8, 0xFF, 0xE0]) + Data(repeating: 0, count: 40)
+    check("openIfSealed passes a plaintext JPEG through untouched",
+          (try? crypto.openIfSealed(jpeg)) == jpeg)
+
+    let secret = Data("secret".utf8)
+    let sealed = try! crypto.seal(secret)
+    check("openIfSealed decrypts a genuinely sealed value",
+          (try? crypto.openIfSealed(sealed)) == secret)
+
+    check("isSealed is false for a plaintext JPEG", !Crypto.isSealed(jpeg))
+    check("isSealed is false for anything shorter than the 32-byte minimum",
+          !Crypto.isSealed(Data(repeating: 0, count: 31)))
+    check("isSealed is true for a genuinely sealed value", Crypto.isSealed(sealed))
+}
+
+// ----------------------------------------------------- Crypto.resolve, the matrix
+//
+// The highest-value coverage in this file: every branch of the policy that
+// decides whether to mint a key, reuse one, or refuse to write anything —
+// checked without a Keychain, which is exactly why `resolve` takes its key
+// store as closures.
+
+// 1. no key + no check file → mints a key, writes the check file.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent },
+                                create: { createCalled = true; return .found(randomKey()) })
+    check("no key + no check file: resolve mints a key", crypto.isReady)
+    check("no key + no check file: create() is called", createCalled)
+    check("no key + no check file: a check file is written",
+          FileManager.default.fileExists(atPath: checkFile.path))
+}
+
+// 2. key present + matching check file → reuses it, creates nothing.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let key = randomKey()
+    _ = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .found(key) }) // seeds the check file
+
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .found(key) },
+                                create: { createCalled = true; return .found(key) })
+    check("key present + matching check file: resolve reuses the key", crypto.isReady)
+    check("key present + matching check file: create() is not called", !createCalled)
+}
+
+// 3. key present but it doesn't open the check file → unavailable, creates nothing.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let keyA = randomKey()
+    let keyB = randomKey()
+    _ = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .found(keyA) }) // check file sealed under keyA
+
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .found(keyB) },
+                                create: { createCalled = true; return .found(keyB) })
+    check("key present but wrong for the check file: resolve reports unavailable", !crypto.isReady)
+    check("key present but wrong for the check file: create() is not called", !createCalled)
+}
+
+// 4. no key + check file present → unavailable, and create() is NOT called.
+// The interlock: a key that is merely unreachable must never be papered over
+// with a fresh one.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    _ = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .found(randomKey()) }) // writes the check file
+
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent },
+                                create: { createCalled = true; return .found(randomKey()) })
+    check("no key + check file present: resolve reports unavailable (the interlock)", !crypto.isReady)
+    check("no key + check file present: create() is NOT called", !createCalled)
+}
+
+// 5. lookup failed (denied/locked) → unavailable, create() NOT called, reason carried through.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .failed("the keychain is locked") },
+                                create: { createCalled = true; return .found(randomKey()) })
+    check("lookup failed: resolve reports unavailable", !crypto.isReady)
+    check("lookup failed: create() is NOT called", !createCalled)
+    check("lookup failed: the reason is carried through unchanged",
+          crypto.unavailableReason == "the keychain is locked", "got \(crypto.unavailableReason ?? "nil")")
+}
+
+// 6. check file removed → the interlock releases and a new key is minted.
+// This is the recovery path `Erase` uses.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    _ = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .found(randomKey()) })
+    try! FileManager.default.removeItem(at: checkFile)
+
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent },
+                                create: { createCalled = true; return .found(randomKey()) })
+    check("removing the check file releases the interlock", crypto.isReady)
+    check("...and a new key is minted", createCalled)
+}
+
+// A few more branches worth pinning while the matrix is open.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    let key = randomKey()
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .found(key) }, create: { .absent })
+    check("a found key with no check file yet is accepted, and a check file is written for it",
+          crypto.isReady && FileManager.default.fileExists(atPath: checkFile.path))
+}
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .absent })
+    check("create() itself coming back absent leaves the store unavailable", !crypto.isReady)
+}
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .failed("denied at the prompt") })
+    check("create() failing carries its reason through",
+          crypto.unavailableReason == "denied at the prompt")
+}
+
+// -------------------------------------------------------------- Rewrap.files
+//
+// pauseEvery: 1000, pauseNanoseconds: 0 throughout so these checks don't sleep.
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+
+    let plainBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x11, count: 100)
+    let plainURL = dir.appendingPathComponent("plain.jpg")
+    try! plainBytes.write(to: plainURL)
+
+    let sealedBytes = try! crypto.seal(Data(repeating: 0x22, count: 100))
+    let sealedURL = dir.appendingPathComponent("sealed.jpg")
+    try! sealedBytes.write(to: sealedURL)
+
+    let nonJpgBytes = Data("not a screenshot".utf8)
+    let nonJpgURL = dir.appendingPathComponent("note.txt")
+    try! nonJpgBytes.write(to: nonJpgURL)
+
+    // Comfortably in the future, so nothing here looks "written since launch".
+    let cutoff = Date().addingTimeInterval(3600)
+    let summary = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
+                                     pauseEvery: 1000, pauseNanoseconds: 0)
+
+    check("Rewrap.files seals exactly the one plaintext capture", summary.sealed == 1, "got \(summary.sealed)")
+    check("Rewrap.files reports no failures", summary.failed == 0, "got \(summary.failed)")
+    check("the plaintext file is now sealed on disk",
+          Crypto.isSealed(try! Data(contentsOf: plainURL)))
+    check("the sealed file decrypts back to its original bytes",
+          (try? crypto.open(Data(contentsOf: plainURL))) == plainBytes)
+    check("an already-sealed file is left byte-identical",
+          (try! Data(contentsOf: sealedURL)) == sealedBytes)
+    check("a non-.jpg file is left completely untouched",
+          (try! Data(contentsOf: nonJpgURL)) == nonJpgBytes)
+
+    let secondPass = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
+                                        pauseEvery: 1000, pauseNanoseconds: 0)
+    check("a second pass over an already-sealed directory seals nothing",
+          secondPass.sealed == 0 && secondPass.failed == 0,
+          "got \(secondPass.sealed) sealed, \(secondPass.failed) failed")
+}()
+
+await { () async -> Void in
+    // Rewrap carries no progress file on purpose — what decides whether a file
+    // still needs doing is the file itself. Simulating "interrupted partway"
+    // is therefore nothing more than a directory holding a mix of sealed and
+    // still-plaintext files; one pass over it has to finish the job.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let cutoff = Date().addingTimeInterval(3600)
+
+    var urls: [URL] = []
+    for i in 0..<6 {
+        let url = dir.appendingPathComponent("shot\(i).jpg")
+        if i % 2 == 0 {
+            try! (Data([0xFF, 0xD8, 0xFF]) + Data(repeating: UInt8(i), count: 20)).write(to: url)
+        } else {
+            try! crypto.seal(Data(repeating: UInt8(i), count: 20)).write(to: url)
+        }
+        urls.append(url)
+    }
+
+    let summary = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
+                                     pauseEvery: 1000, pauseNanoseconds: 0)
+    check("resuming a mid-migration directory seals exactly the plaintext half",
+          summary.sealed == 3, "got \(summary.sealed)")
+
+    let allReadable = urls.allSatisfy { url in
+        guard let raw = try? Data(contentsOf: url), Crypto.isSealed(raw),
+              (try? crypto.open(raw)) != nil else { return false }
+        return true
+    }
+    check("every file — the ones already sealed and the ones just resumed — is readable afterwards",
+          allReadable)
+}()
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    // A cutoff in the past: the file below, written just now, is modified
+    // at/after it and must be skipped rather than rewritten mid-arrival.
+    let past = Date().addingTimeInterval(-3600)
+
+    let recentBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x33, count: 20)
+    let recentURL = dir.appendingPathComponent("recent.jpg")
+    try! recentBytes.write(to: recentURL)
+
+    let summary = await Rewrap.files(in: dir, using: crypto, writtenBefore: past,
+                                     pauseEvery: 1000, pauseNanoseconds: 0)
+    check("a file modified at/after the writtenBefore cutoff is skipped",
+          summary.sealed == 0, "got \(summary.sealed)")
+    check("...and stays plaintext on disk",
+          (try! Data(contentsOf: recentURL)) == recentBytes)
+}()
+
+// ------------------------------------------------------- Store.sealPlaintextSpans
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+    struct Seed { let id: Int64; let title: String?; let url: String? }
+    let pairs: [(String?, String?)] = [
+        ("Q3 Layoff List.xlsx", "https://docs.example.com/q3"),
+        ("Reset your password", "https://example.com/reset?token=abc123"),
+        ("Inbox (14)", nil),   // nil URL must stay nil
+        (nil, nil),            // already fully NULL — nothing eligible here
+        ("Inbox (14)", nil),   // same title as a row above, different span
+        ("Dashboard", "https://example.com/dash"),
+    ]
+    var seeds: [Seed] = []
+    for (i, pair) in pairs.enumerated() {
+        let id = insertPlaintextSpan(dbPath: dbPath,
+                                     start: t0.addingTimeInterval(Double(i) * 120),
+                                     end: t0.addingTimeInterval(Double(i) * 120 + 60),
+                                     bundleId: "app.test", appName: "Test App",
+                                     title: pair.0, url: pair.1, kind: .active)
+        seeds.append(Seed(id: id, title: pair.0, url: pair.1))
+    }
+    let eligible = pairs.filter { $0.0 != nil || $0.1 != nil }.count
+
+    let firstBatch = store.sealPlaintextSpans(limit: 3)
+    check("sealPlaintextSpans respects its limit", firstBatch == 3, "got \(firstBatch)")
+
+    let rest = await Rewrap.spans(in: store, batch: 3, pauseNanoseconds: 0)
+    check("Rewrap.spans resumes and finishes sealing every remaining plaintext row",
+          firstBatch + rest == eligible, "sealed \(firstBatch + rest) of \(eligible) eligible rows")
+
+    let secondPass = store.sealPlaintextSpans()
+    check("a second full pass over an already-sealed table seals zero rows", secondPass == 0)
+
+    let spans = store.spans(from: t0.addingTimeInterval(-1), to: t0.addingTimeInterval(3600))
+    let byId = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
+    var titlesMatch = true, urlsMatch = true, nilsStayNil = true
+    for seed in seeds {
+        guard let span = byId[seed.id] else { titlesMatch = false; urlsMatch = false; continue }
+        if span.title != seed.title { titlesMatch = false }
+        if span.url != seed.url { urlsMatch = false }
+        if seed.title == nil && span.title != nil { nilsStayNil = false }
+        if seed.url == nil && span.url != nil { nilsStayNil = false }
+    }
+    check("every title reads back identical to what was written before sealing", titlesMatch)
+    check("every URL reads back identical to what was written before sealing", urlsMatch)
+    check("rows with a nil title/URL stay nil after the migration", nilsStayNil)
+
+    store.close()
+}()
+
+do {
+    // Without a key, sealPlaintextSpans must return 0 — not seal what it can
+    // and drop the rest, and never null out what it couldn't seal.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let seedStore = Store(directory: dir, crypto: Crypto(key: randomKey()))
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+    let id = insertPlaintextSpan(dbPath: dbPath,
+                                 start: Date(timeIntervalSince1970: 1_800_000_000),
+                                 end: Date(timeIntervalSince1970: 1_800_000_060),
+                                 bundleId: "a", appName: "A",
+                                 title: "Still here", url: "https://still-here.example.com", kind: .active)
+    seedStore.close()
+
+    let lockedStore = Store(directory: dir, crypto: Crypto(unavailable: "no key for this check"))
+    let sealed = lockedStore.sealPlaintextSpans()
+    check("sealPlaintextSpans with an unavailable Crypto seals nothing", sealed == 0, "got \(sealed)")
+    lockedStore.close()
+
+    var rawTitle: Database.Value = .null
+    let raw = Database(path: dbPath)
+    raw.run("SELECT window_title FROM activity_spans WHERE id = ?", bind: [id]) { s in
+        rawTitle = Database.value(s, 0)
+    }
+    raw.close()
+    if case .text("Still here") = rawTitle {
+        check("the plaintext title is left exactly as it was, not nulled out", true)
+    } else {
+        check("the plaintext title is left exactly as it was, not nulled out", false, "got \(rawTitle)")
+    }
+}
+
+// ------------------------------------------------------- mixed-format DB reads
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+
+    let sealedId = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                                    end: Date(timeIntervalSince1970: 1_800_000_060),
+                                    bundleId: "a", appName: "A",
+                                    title: "Sealed Title", url: "https://sealed.example.com", kind: .active)
+    let plainId = insertPlaintextSpan(dbPath: dbPath,
+                                      start: Date(timeIntervalSince1970: 1_800_000_120),
+                                      end: Date(timeIntervalSince1970: 1_800_000_180),
+                                      bundleId: "b", appName: "B",
+                                      title: "Plain Title", url: "https://plain.example.com", kind: .active)
+
+    let spans = store.spans(from: Date(timeIntervalSince1970: 1_800_000_000),
+                            to: Date(timeIntervalSince1970: 1_800_000_200))
+    let byId = Dictionary(uniqueKeysWithValues: spans.map { ($0.id, $0) })
+    check("a store holding one sealed row reads it back correctly",
+          byId[sealedId]?.title == "Sealed Title" && byId[sealedId]?.url == "https://sealed.example.com")
+    check("...and one plaintext row alongside it, untouched",
+          byId[plainId]?.title == "Plain Title" && byId[plainId]?.url == "https://plain.example.com")
+    store.close()
+}
+
+// ------------------------------------------------------------------ titleTotals
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+
+    // Three spans, same title+URL, 100s each — must group into one 300s row
+    // despite three different nonces (Crypto.seal's whole reason titleTotals
+    // can't GROUP BY in SQL any more).
+    for i in 0..<3 {
+        store.insertSpan(start: t0.addingTimeInterval(Double(i) * 200),
+                         end: t0.addingTimeInterval(Double(i) * 200 + 100),
+                         bundleId: "app.a", appName: "App A",
+                         title: "Dashboard", url: "https://example.com/dash", kind: .active)
+    }
+    // Same title, different URL — must stay its own row.
+    store.insertSpan(start: t0.addingTimeInterval(1000), end: t0.addingTimeInterval(1150),
+                     bundleId: "app.a", appName: "App A",
+                     title: "Dashboard", url: "https://example.com/other", kind: .active)
+    // Two equal-duration, differently-titled rows for the tie-break check.
+    store.insertSpan(start: t0.addingTimeInterval(3000), end: t0.addingTimeInterval(3010),
+                     bundleId: "app.a", appName: "App A", title: "Zeta", url: nil, kind: .active)
+    store.insertSpan(start: t0.addingTimeInterval(4000), end: t0.addingTimeInterval(4010),
+                     bundleId: "app.a", appName: "App A", title: "Alpha", url: nil, kind: .active)
+
+    let totals = store.titleTotals(from: t0, to: t0.addingTimeInterval(10_000), bundleId: "app.a")
+
+    let dashboard = totals.first { $0.title == "Dashboard" && $0.url == "https://example.com/dash" }
+    check("three identically-titled spans group into one row despite three different nonces",
+          dashboard.map { abs($0.seconds - 300) < 0.001 } ?? false,
+          "got \(String(describing: dashboard))")
+
+    let dashboardOther = totals.first { $0.title == "Dashboard" && $0.url == "https://example.com/other" }
+    check("the same title under a different URL stays a separate row",
+          dashboardOther.map { abs($0.seconds - 150) < 0.001 } ?? false,
+          "got \(String(describing: dashboardOther))")
+
+    check("titleTotals rows come back longest-first",
+          totals.map { $0.seconds } == totals.map { $0.seconds }.sorted(by: >),
+          "got \(totals.map { $0.seconds })")
+
+    let tie = totals.filter { abs($0.seconds - 10) < 0.001 }
+    check("tied durations break by title, alphabetically",
+          tie.map { $0.title } == ["Alpha", "Zeta"], "got \(tie.map { $0.title })")
+
+    store.close()
+}
+
+// ---------------------------------------------- appTotals / dayStats unaffected
+//
+// Both deliberately never touch window_title or url — they must keep summing
+// the same numbers for a store whose titles happen to be sealed.
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let t0 = Date(timeIntervalSince1970: 1_800_000_000)
+
+    store.insertSpan(start: t0, end: t0.addingTimeInterval(600),
+                     bundleId: "com.example.app", appName: "Example",
+                     title: "Something Secret", url: "https://secret.example.com/x", kind: .active)
+    store.insertSpan(start: t0.addingTimeInterval(600), end: t0.addingTimeInterval(900),
+                     bundleId: "com.example.app", appName: "Example",
+                     title: nil, url: nil, kind: .idle)
+
+    let apps = store.appTotals(from: t0, to: t0.addingTimeInterval(900))
+    check("appTotals still sums the active seconds for an app with sealed titles",
+          apps.first?.seconds == 600, "got \(apps.first?.seconds ?? -1)")
+
+    let days = store.dayStats(from: t0, to: t0.addingTimeInterval(900))
+    check("dayStats still sums active and idle seconds for a store with sealed titles",
+          days.first?.activeSeconds == 600 && days.first?.idleSeconds == 300,
+          "got \(String(describing: days.first))")
+
+    store.close()
+}
+
+// --------------------------------------------------------------- key unavailable
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir, crypto: Crypto(unavailable: "no key for this check"))
+
+    let id = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                              end: Date(timeIntervalSince1970: 1_800_000_060),
+                              bundleId: "com.example.app", appName: "Example",
+                              title: "Should not be written", url: "https://should-not-be-written.example.com",
+                              kind: .active)
+
+    let spans = store.spans(from: Date(timeIntervalSince1970: 1_800_000_000),
+                            to: Date(timeIntervalSince1970: 1_800_000_100))
+    let span = spans.first { $0.id == id }
+    check("insertSpan still records the app, times and kind without a key",
+          span?.bundleId == "com.example.app" && span?.duration == 60 && span?.kind == .active)
+    check("insertSpan drops the title without a key", span?.title == nil, "got \(span?.title ?? "nil")")
+    check("insertSpan drops the URL without a key", span?.url == nil, "got \(span?.url ?? "nil")")
+
+    store.close()
+}
+
+do {
+    // A blob that passes isSealed (right magic, long enough) but won't
+    // authenticate — a row sealed under a key this store no longer has, or
+    // bit rot. Must read back as Store.locked, never as nil: nil means
+    // "nothing was recorded here", and this is history still sitting on disk.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir, crypto: Crypto(key: randomKey()))
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+
+    let garbage = Crypto.magic + Data(repeating: 0xAB, count: 12 + 20 + 16)
+    let raw = Database(path: dbPath)
+    raw.run("""
+    INSERT INTO activity_spans (start, end, app_bundle_id, app_name, window_title, url, kind)
+    VALUES (?,?,?,?,?,?,?)
+    """, bind: [1_800_000_000.0, 1_800_000_060.0, "c", "C", garbage, nil, "active"])
+    raw.close()
+
+    let spans = store.spans(from: Date(timeIntervalSince1970: 1_800_000_000),
+                            to: Date(timeIntervalSince1970: 1_800_000_100))
+    check("a blob that won't decrypt reads back as Store.locked, not nil",
+          spans.first?.title == Store.locked, "got \(String(describing: spans.first?.title))")
+
+    store.close()
+}
+
+// -------------------------------------------------------------- Erase interaction
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    try! Data("stand-in check file contents".utf8).write(to: checkFile)
+
+    let takenAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let dayKey = Format.dayKey.string(from: takenAt)
+    let dayDir = store.screenshotsDir.appendingPathComponent(dayKey, isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+    let shotURL = dayDir.appendingPathComponent("shot.jpg")
+    try! crypto.seal(Data(repeating: 0x99, count: 500)).write(to: shotURL)
+
+    store.insertScreenshot(takenAt: takenAt, day: dayKey, displayID: 0,
+                           path: shotURL.path, thumbPath: "", isActive: false)
+    store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
+                     bundleId: "x", appName: "X", title: "Sealed span", url: nil, kind: .active)
+
+    let summary = await Erase.data(from: nil, to: nil, in: store)
+    check("erase-all with a sealed capture on disk still deletes its screenshot row",
+          summary.screenshots == 1, "got \(summary.screenshots)")
+    check("erase-all with a sealed capture on disk still deletes its span row",
+          summary.spans == 1, "got \(summary.spans)")
+    check("erase-all with a sealed capture on disk unlinks it with no failures",
+          summary.failedFiles == 0, "got \(summary.failedFiles)")
+    check("an unbounded erase removes the key-check file — the recovery path",
+          !FileManager.default.fileExists(atPath: checkFile.path))
+
+    store.close()
+}()
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir, crypto: Crypto(key: randomKey()))
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    try! Data("stand-in check file contents".utf8).write(to: checkFile)
+
+    let takenAt = Date(timeIntervalSince1970: 1_800_000_000)
+    store.insertScreenshot(takenAt: takenAt, day: Format.dayKey.string(from: takenAt),
+                           displayID: 0, path: "", thumbPath: "", isActive: false)
+
+    _ = await Erase.data(from: takenAt, to: takenAt.addingTimeInterval(3600), in: store)
+    check("a ranged erase leaves the key-check file alone",
+          FileManager.default.fileExists(atPath: checkFile.path))
+
+    store.close()
+}()
+
+// The finding demonstrated rather than asserted: a written title is provably
+// absent from the database file bytes, while the (deliberately unencrypted)
+// app_bundle_id is right there in the clear.
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir, crypto: Crypto(key: randomKey()))
+
+    store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                     end: Date(timeIntervalSince1970: 1_800_000_060),
+                     bundleId: "com.example.findme", appName: "Findme",
+                     title: "A Very Findable Secret Title", url: nil, kind: .active)
+    store.close() // flush the WAL so the finding is checkable in the main file
+
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+    let dbBytes = try! Data(contentsOf: URL(fileURLWithPath: dbPath))
+    let walBytes = (try? Data(contentsOf: URL(fileURLWithPath: dbPath + "-wal"))) ?? Data()
+
+    check("a written title does not appear anywhere in the database file bytes",
+          !containsBytes(dbBytes, "A Very Findable Secret Title")
+            && !containsBytes(walBytes, "A Very Findable Secret Title"))
+    check("but the (deliberately unencrypted) app_bundle_id does",
+          containsBytes(dbBytes, "com.example.findme") || containsBytes(walBytes, "com.example.findme"))
+}()
+
+// ------------------------------------------------ Store.sweepExports, the viewer's
+// decrypted copies for "Open in Preview". Both members are plain statics with
+// an injectable directory, so they test synchronously with no store involved.
+// Never called with its default argument here — that is the real, shared
+// directory, and clearing it out from under whatever else is running on this
+// machine is exactly what these checks must not do.
+
+do {
+    let parent = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let dir = parent.appendingPathComponent("decrypted-copies", isDirectory: true)
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    try! Data([0xFF, 0xD8, 0xFF]).write(to: dir.appendingPathComponent("shot.jpg"))
+
+    Store.sweepExports(dir)
+    check("sweepExports removes a directory holding decrypted copies",
+          !FileManager.default.fileExists(atPath: dir.path))
+}
+
+do {
+    let parent = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: parent) }
+    let neverCreated = parent.appendingPathComponent("never-created", isDirectory: true)
+
+    // Most launches have nothing to clear — this must not throw or touch
+    // anything outside the directory it was given.
+    Store.sweepExports(neverCreated)
+    check("sweepExports on a directory that never existed is harmless",
+          !FileManager.default.fileExists(atPath: neverCreated.path))
+    check("...and leaves its parent directory alone",
+          FileManager.default.fileExists(atPath: parent.path))
+}
+
+// Pinned precisely because the function is an unconditional recursive
+// delete: a future edit that pointed it one level up would wipe the user's
+// whole temp directory rather than just MacTime's corner of it.
+check("Store.exportDir is a MacTime-specific subdirectory of the temp root, never the root itself",
+      Store.exportDir.lastPathComponent == "MacTime"
+        && Store.exportDir.deletingLastPathComponent().standardizedFileURL
+             == URL(fileURLWithPath: NSTemporaryDirectory()).standardizedFileURL,
+      "got \(Store.exportDir.path)")
 
 // ------------------------------------------------------------------- report
 
