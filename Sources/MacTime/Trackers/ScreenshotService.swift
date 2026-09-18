@@ -11,6 +11,9 @@ final class ScreenshotService {
     private var lastCaptureAt: Date?
     private var capturing = false
     private var captureTask: Task<Void, Never>?
+    /// The key can't come back without a relaunch, so say so once rather than
+    /// every five seconds for as long as the app is open.
+    private var loggedKeyUnavailable = false
     private let encodeQueue = DispatchQueue(label: "mactime.screenshot.encode", qos: .utility)
 
     /// Pausing has to reach the round already in flight, not just the next one:
@@ -53,10 +56,23 @@ final class ScreenshotService {
             return
         }
         lastCaptureAt = now
-        capturing = true
-        captureTask = Task { @MainActor in
-            await self.captureRound(at: now)
-            self.capturing = false
+        // A capture that can't be sealed must not be taken. Writing it in the
+        // clear is exactly the problem encryption exists to fix, so dropping
+        // the round is the lesser harm — and it is checked here, below the
+        // interval test, so the compositor is never asked for a 5K frame that
+        // is only going to be thrown away. Retention below still runs: leaving
+        // captures past their window because the key went missing would be a
+        // second failure on top of the first.
+        if Crypto.shared.isReady {
+            capturing = true
+            captureTask = Task { @MainActor in
+                await self.captureRound(at: now)
+                self.capturing = false
+            }
+        } else if !loggedKeyUnavailable {
+            loggedKeyUnavailable = true
+            NSLog("MacTime: not capturing — %@",
+                  Crypto.shared.unavailableReason ?? "no data key")
         }
 
         // Prune once a day, on the first tick past midnight.
@@ -152,9 +168,28 @@ final class ScreenshotService {
                 NSLog("MacTime: jpeg encode failed for %@", base)
                 return
             }
+            // Sealed here, on the encode queue, alongside the JPEG encode that
+            // already costs tens of ms — AES runs in hardware on this target, so
+            // a full frame is about 0.3 ms of it. Nothing about encryption
+            // touches the main thread, which is what keeps the hover-scrub path
+            // in DayView where it was.
+            //
+            // `tick` already refused the round without a key; this is the one
+            // that matters, because it is the last point before bytes hit the
+            // disk. There is no plaintext branch on purpose.
+            let crypto = Crypto.shared
+            guard let fullOut = try? crypto.seal(full), let thumbOut = try? crypto.seal(thumb) else {
+                NSLog("MacTime: screenshot dropped, not written in the clear — %@",
+                      crypto.unavailableReason ?? "encryption failed")
+                return
+            }
             do {
-                try full.write(to: fullURL)
-                try thumb.write(to: thumbURL)
+                // Atomically, so a crash or a kill mid-write can't leave a
+                // truncated file behind. It mattered less when these were
+                // JPEGs, which merely drew short; a half-written sealed capture
+                // fails authentication and is simply lost.
+                try fullOut.write(to: fullURL, options: .atomic)
+                try thumbOut.write(to: thumbURL, options: .atomic)
             } catch {
                 NSLog("MacTime: screenshot write failed: %@", "\(error)")
                 return

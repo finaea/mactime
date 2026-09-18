@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 enum SpanKind: String {
@@ -57,19 +58,43 @@ struct DayStat: Identifiable {
 final class Store {
     let dataDir: URL
     let screenshotsDir: URL
+    let crypto: Crypto
     private let db: Database
 
     /// `directory` is only ever passed by the checks in Tests/, which need a
     /// store they can create, fill and throw away — the app always takes the
     /// default. Retention and erasure delete files, so exercising them against
     /// `~/Library/Application Support/MacTime` is not an option.
-    init(directory: URL? = nil) {
+    ///
+    /// `crypto` follows the same rule, and its default leans on it: a store
+    /// given a directory is a throwaway, so it gets a throwaway key rather than
+    /// reaching for the login keychain. A check run must never read the key the
+    /// real store is sealed with, and — worse — must never be the thing that
+    /// creates it. The consequence for the checks is that reopening the same
+    /// directory needs the same `Crypto` passed back in; a fresh one cannot
+    /// read what the last one wrote, which is the property being relied on.
+    init(directory: URL? = nil, crypto: Crypto? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         dataDir = directory ?? appSupport.appendingPathComponent("MacTime", isDirectory: true)
         screenshotsDir = dataDir.appendingPathComponent("Screenshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
+        self.crypto = crypto ?? (directory == nil
+            ? Crypto.forLoginKeychain(dataDir: dataDir)
+            : Crypto(key: SymmetricKey(size: .bits256)))
+        // The read path reaches places a store reference doesn't — a thumbnail
+        // cell holds a path and nothing else — so the resolved key is published
+        // process-wide here, at the one point that runs exactly once per launch.
+        Crypto.install(self.crypto)
         db = Database(path: dataDir.appendingPathComponent("MacTime.db").path)
         migrate()
+
+        // Captures written before this shipped are plaintext, and up to a
+        // ninety-day retention window of them can be sitting there. Sealing
+        // them is background work that must not hold up launch, so it is
+        // started and forgotten. Hung off `init` rather than off a service's
+        // `start()` because this is the one place guaranteed to run once per
+        // launch whatever the tracking settings say.
+        if directory == nil { Rewrap.start(in: self) }
     }
 
     func close() { db.close() }

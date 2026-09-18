@@ -210,6 +210,17 @@ struct DayView: View {
                       ? "photo.on.rectangle" : "photo.fill.on.rectangle.fill")
             }
             .help("Screenshot viewer — follows the timeline hover (Space)")
+            // Only ever shown when the data key couldn't be resolved at launch.
+            // The captures below are ciphertext then, so their tiles stay
+            // blank — without this the day reads as "nothing was recorded",
+            // which is the one thing it must not say about history that is
+            // sitting on disk intact.
+            if let why = Crypto.shared.unavailableReason {
+                Label("Data key unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                    .help(why)
+            }
             Spacer()
             if let sel = model.selection {
                 Text("Selection: \(Format.time.string(from: sel.lowerBound))–\(Format.time.string(from: sel.upperBound))")
@@ -1163,7 +1174,21 @@ struct DockedViewer: View {
                     .simultaneousGesture(zoomGesture)
                     .onTapGesture(count: 2) { model.resetViewerTransform() }
                 } else if current != nil {
-                    ProgressView()
+                    if let why = Crypto.shared.unavailableReason {
+                        // Not a spinner: nothing is loading and nothing is
+                        // going to. The capture is still there and still
+                        // intact, so say what is actually wrong instead of
+                        // leaving a viewer that looks like it is about to
+                        // show something.
+                        Text(why)
+                            .font(.callout)
+                            .foregroundStyle(.white.opacity(0.85))
+                            .multilineTextAlignment(.center)
+                            .frame(maxWidth: 460)
+                            .padding(24)
+                    } else {
+                        ProgressView()
+                    }
                 }
             }
             .clipped()
@@ -1184,7 +1209,7 @@ struct DockedViewer: View {
             model.lastLiveShot = current
             let paths = DayModel.displayed(model.group(containing: current)).map(\.path)
             let loaded = await Task.detached(priority: .userInitiated) {
-                paths.compactMap { NSImage(contentsOfFile: $0) }
+                paths.compactMap { ImageCache.decode(path: $0) }
             }.value
             // SwiftUI cancels this task when the hover moves on, but cancelling
             // it doesn't reach the detached read — so a slow round can still
@@ -1223,10 +1248,16 @@ struct DockedViewer: View {
             }
     }
 
+    // Both of the actions that hand a capture to something outside MacTime have
+    // to decrypt it first. Passing the stored file along would give Preview,
+    // and the user's chosen save location, a `.jpg` full of ciphertext — the
+    // failure would be silent and would look like the app corrupting its own
+    // screenshots.
     @ViewBuilder
     private func actions(for shot: ScreenshotRecord) -> some View {
         Button("Open in Preview") {
-            NSWorkspace.shared.open(URL(fileURLWithPath: shot.path))
+            guard let file = Self.decrypted(shot, into: Self.exportDirectory) else { return }
+            NSWorkspace.shared.open(file)
         }
         Button("Show in Finder") {
             NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: shot.path)])
@@ -1240,14 +1271,38 @@ struct DockedViewer: View {
             let panel = NSSavePanel()
             panel.nameFieldStringValue = URL(fileURLWithPath: shot.path).lastPathComponent
             panel.begin { response in
-                guard response == .OK, let dest = panel.url else { return }
-                try? FileManager.default.copyItem(at: URL(fileURLWithPath: shot.path), to: dest)
+                guard response == .OK, let dest = panel.url,
+                      let jpeg = Self.jpeg(of: shot) else { return }
+                try? jpeg.write(to: dest, options: .atomic)
             }
         }
         Divider()
         Button("Delete", role: .destructive) {
             model.delete(shot)
         }
+    }
+
+    /// Where "Open in Preview" leaves its decrypted copy. It is plaintext, in
+    /// a directory macOS clears between boots — the one thing that makes it
+    /// acceptable is that the user just asked for this capture to be opened in
+    /// another app, same as Save As…, which writes plaintext wherever they
+    /// point it. Nothing else is written here, and mode 0600 keeps it out of
+    /// reach of other accounts on the machine.
+    private static let exportDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("MacTime", isDirectory: true)
+
+    private static func jpeg(of shot: ScreenshotRecord) -> Data? {
+        guard let raw = try? Data(contentsOf: URL(fileURLWithPath: shot.path)) else { return nil }
+        return try? Crypto.shared.openIfSealed(raw)
+    }
+
+    private static func decrypted(_ shot: ScreenshotRecord, into dir: URL) -> URL? {
+        guard let jpeg = jpeg(of: shot) else { return nil }
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        let file = dir.appendingPathComponent(URL(fileURLWithPath: shot.path).lastPathComponent)
+        guard (try? jpeg.write(to: file, options: .atomic)) != nil else { return nil }
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        return file
     }
 
     private func kindColor(_ kind: SpanKind?) -> Color {

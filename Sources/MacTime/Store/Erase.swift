@@ -41,6 +41,7 @@ enum Erase {
         // off the main thread.
         let todayKey = Format.dayKey.string(from: Date())
         let diagnostics = store.dataDir.appendingPathComponent("diagnostics.txt")
+        let keyCheck = store.dataDir.appendingPathComponent(Crypto.checkFileName)
 
         var screenshots = 0, failed = 0
         // Collect, unlink, then delete exactly what was collected — and go
@@ -70,7 +71,17 @@ enum Erase {
             // Written unconditionally 3s after every launch and it carries the
             // frontmost window's title, so "delete everything" has to take it
             // too — erasure that leaves a window title in plain text isn't.
-            if everything { try? FileManager.default.removeItem(at: diagnostics) }
+            if everything {
+                try? FileManager.default.removeItem(at: diagnostics)
+                // The key-check file is what stops the app minting a new key
+                // over data sealed with one it can't reach (`Crypto.resolve`).
+                // Once everything sealed with that key is gone the interlock
+                // has nothing left to protect, and leaving it would strand a
+                // user whose key went missing with an app that will never
+                // record again. This is the release valve: erase everything,
+                // relaunch, get a fresh key.
+                try? FileManager.default.removeItem(at: keyCheck)
+            }
         }.value
 
         let summary = Summary(screenshots: screenshots, spans: spans, failedFiles: failed)

@@ -24,8 +24,22 @@ enum ImageCache {
 
     static func image(path: String) async -> NSImage? {
         if let hit = cached(path: path) { return hit }
-        let loaded = await Task.detached(priority: .utility) { NSImage(contentsOfFile: path) }.value
+        let loaded = await Task.detached(priority: .utility) { decode(path: path) }.value
         if let loaded { cache.setObject(loaded, forKey: path as NSString) }
         return loaded
+    }
+
+    /// Read, decrypt, decode — rather than `NSImage(contentsOfFile:)`, which
+    /// can only see a plaintext JPEG.
+    ///
+    /// Sealed or not is decided per file, not per app version: while `Rewrap`
+    /// is working through the backlog the same day folder holds both, so the
+    /// file itself has to say. Decryption happens here, behind the cache, which
+    /// means once per image rather than once per frame — the hover preview
+    /// re-reads `cached(path:)` on every mouse move and must keep hitting it.
+    static func decode(path: String) -> NSImage? {
+        guard let raw = try? Data(contentsOf: URL(fileURLWithPath: path)),
+              let jpeg = try? Crypto.shared.openIfSealed(raw) else { return nil }
+        return NSImage(data: jpeg)
     }
 }

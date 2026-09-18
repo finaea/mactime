@@ -8,6 +8,11 @@
 # @State, so `swift build` cannot succeed here either. Compiling only the
 # sources these checks exercise keeps them runnable. AppKit is fine — Format and
 # ImageCache import it — the one thing that can't be in this list is SwiftUI.
+#
+# DataKeychain.swift is compiled but must never be *called*: the checks build
+# their own key and pass it to Store, because a check run must not read the key
+# the real store is sealed with, and must certainly not be what creates it.
+# tools/typecheck.sh covers the SwiftUI files this can't reach.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -21,6 +26,9 @@ swiftc -swift-version 5 -target arm64-apple-macos15.0 \
     Sources/MacTime/Support/TimeMath.swift \
     Sources/MacTime/Support/ImageCache.swift \
     Sources/MacTime/Store/Database.swift \
+    Sources/MacTime/Store/Crypto.swift \
+    Sources/MacTime/Store/DataKeychain.swift \
+    Sources/MacTime/Store/Rewrap.swift \
     Sources/MacTime/Store/Store.swift \
     Sources/MacTime/Store/Erase.swift \
     Tests/TimeMathTests/main.swift \
