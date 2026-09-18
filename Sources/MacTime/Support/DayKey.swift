@@ -50,6 +50,13 @@ enum DayKey {
     ///   captures inside it were deleted by `taken_at`, wherever they sat, so
     ///   it is empty by the time this runs. Without it those folders would sit
     ///   there forever — the accumulate-silently failure, surviving its own fix.
+    ///   It is therefore the one verdict that ignores `from` and `to`
+    ///   entirely, and the reason this can act outside the range it was handed:
+    ///   a retention sweep at a fourteen-day cutoff also tidies away an empty
+    ///   folder dated yesterday. Deliberate — an empty folder has no captures
+    ///   to be inside a range or outside it, and the alternative is leaving it
+    ///   until some later sweep's cutoff happens to pass its date. Today's is
+    ///   the only one spared, for the reason below.
     /// - `removeCovered` is the only thing that can reach a JPEG with no row
     ///   (a file write that landed while its insert didn't), so it needs a
     ///   datable name and takes the whole folder. It fires only when the day it
