@@ -1797,6 +1797,287 @@ do {
     reopened.close()
 }
 
+// ============================================================================
+// Settings.paused — persisted across a "restart" (a fresh UserDefaults
+// instance for the same suite), and immune to registerDefaults() re-running
+// at every launch.
+// ============================================================================
+//
+// Settings.d is a `var` precisely so this can point it at a throwaway suite
+// rather than the user's real settings — a check run must not read, and must
+// certainly not write, whether the real app is paused.
+do {
+    let suiteName = "mactime-tests-\(UUID().uuidString)"
+    let savedDefaults = Settings.d
+    defer {
+        Settings.d = savedDefaults
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+    }
+
+    Settings.d = UserDefaults(suiteName: suiteName)!
+
+    Settings.registerDefaults()
+    check("the registered default for paused is false", Settings.paused == false)
+
+    Settings.setPaused(true)
+    check("a set value reads back", Settings.paused == true)
+
+    // The "restart": the process went away, but the suite's data is on disk —
+    // a brand-new UserDefaults instance for the same suite has to see it too,
+    // not just the instance that wrote it.
+    let freshInstance = UserDefaults(suiteName: suiteName)!
+    check("a fresh UserDefaults instance for the same suite still sees the pause",
+          freshInstance.bool(forKey: Settings.Key.paused))
+
+    // The actual restart bug (commit 0c21f3f): registerDefaults() runs at
+    // every launch, so if it overwrote a stored pause, a paused user would be
+    // recording again the moment they reopened the app.
+    Settings.registerDefaults()
+    check("registerDefaults() does not clobber a stored true",
+          Settings.paused == true)
+}
+
+// ============================================================================
+// AppLock.gate — the pure decision behind both windows' lock. Checked without
+// a real LAContext or biometric prompt: `authenticate` is a plain closure the
+// checks control, never AppLock.authenticate itself.
+// ============================================================================
+
+do {
+    @discardableResult
+    func run(enabled: Bool, alreadyVisible: Bool, authenticated: Bool) -> (authCalled: Int, presentCalled: Int) {
+        var authCalled = 0
+        var presentCalled = 0
+        AppLock.gate(enabled: enabled, alreadyVisible: alreadyVisible,
+                    authenticate: { completion in
+                        authCalled += 1
+                        completion(authenticated)
+                    },
+                    present: { presentCalled += 1 })
+        return (authCalled, presentCalled)
+    }
+
+    let disabled = run(enabled: false, alreadyVisible: false, authenticated: false)
+    check("disabled: present runs", disabled.presentCalled == 1)
+    check("disabled: authenticate is never called", disabled.authCalled == 0)
+
+    let alreadyOpen = run(enabled: true, alreadyVisible: true, authenticated: false)
+    check("enabled + already visible: present runs", alreadyOpen.presentCalled == 1)
+    check("enabled + already visible: authenticate is never called — no re-prompt on an open app",
+          alreadyOpen.authCalled == 0)
+
+    let succeeded = run(enabled: true, alreadyVisible: false, authenticated: true)
+    check("enabled + closed + auth succeeds: present runs exactly once",
+          succeeded.presentCalled == 1, "got \(succeeded.presentCalled)")
+
+    let failed = run(enabled: true, alreadyVisible: false, authenticated: false)
+    check("enabled + closed + auth fails or is cancelled: present never runs",
+          failed.presentCalled == 0, "got \(failed.presentCalled)")
+}
+
+// ============================================================================
+// CaptureSuspension — the counted hold Erase.data takes via `defer`, and must
+// release on every exit path, early returns included.
+// ============================================================================
+
+check("CaptureSuspension starts clear", !CaptureSuspension.isSuspended)
+
+do {
+    // The nesting property overlapping holds depend on — the retention sweep
+    // and a user-initiated "Delete data" can run at once, and the first to
+    // finish must not release the other's hold.
+    CaptureSuspension.begin()
+    CaptureSuspension.begin()
+    CaptureSuspension.end()
+    check("two begin()s: still suspended after only one end()", CaptureSuspension.isSuspended)
+    CaptureSuspension.end()
+    check("two begin()s: clear only after the second end()", !CaptureSuspension.isSuspended)
+}
+
+await { () async -> Void in
+    // A bounded erase that actually deletes rows.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let takenAt = Date(timeIntervalSince1970: 1_800_000_000)
+    store.insertScreenshot(takenAt: takenAt, day: Format.dayKey.string(from: takenAt),
+                           displayID: 0, path: "", thumbPath: "", isActive: false)
+    _ = store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
+                         bundleId: "x", appName: "X", title: nil, url: nil, kind: .active)
+
+    let summary = await Erase.data(from: takenAt, to: takenAt.addingTimeInterval(3600), in: store,
+                                 contents: .capturesAndActivity)
+    check("a bounded erase that deletes rows reports what it deleted",
+          summary.screenshots == 1 && summary.spans == 1,
+          "got \(summary.screenshots) screenshots, \(summary.spans) spans")
+    check("isSuspended is released after a bounded, deleting erase",
+          !CaptureSuspension.isSuspended)
+}()
+
+await { () async -> Void in
+    // nil/nil: delete everything.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let takenAt = Date(timeIntervalSince1970: 1_800_000_000)
+    store.insertScreenshot(takenAt: takenAt, day: Format.dayKey.string(from: takenAt),
+                           displayID: 0, path: "", thumbPath: "", isActive: false)
+
+    let summary = await Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
+    check("erase-everything (nil/nil) reports what it deleted",
+          summary.screenshots == 1, "got \(summary.screenshots)")
+    check("isSuspended is released after erase-everything",
+          !CaptureSuspension.isSuspended)
+}()
+
+await { () async -> Void in
+    // An empty range hits the `guard screenshots + spans > 0 else { return
+    // summary }` early return — exactly the path a `defer` exists for, and a
+    // hand-placed release before that guard would have missed.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let from = Date(timeIntervalSince1970: 1_800_000_000)
+    let to = from.addingTimeInterval(3600)
+    let summary = await Erase.data(from: from, to: to, in: store, contents: .capturesAndActivity)
+
+    check("an erase over an empty range reports nothing deleted",
+          summary.screenshots == 0 && summary.spans == 0)
+    check("isSuspended is released after an early-return (empty-range) erase",
+          !CaptureSuspension.isSuspended)
+}()
+
+// ============================================================================
+// Erase.Contents — retention (.capturesOnly) must never touch activity spans;
+// "Delete data" (.capturesAndActivity) still does. The bug this guards nearly
+// erased every user's whole activity history on the very first retention
+// sweep — screenshots or not, since a user who never turned screenshots on
+// still had spans.
+// ============================================================================
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    // A user who never enabled screenshots: zero screenshot rows, spans
+    // spread across ~120 days, so a retention sweep has plenty to wrongly
+    // delete if it isn't actually scoped to captures.
+    let cal = Calendar.current
+    let now = Date()
+    for daysAgo in stride(from: 0, through: 120, by: 5) {
+        let start = cal.date(byAdding: .day, value: -daysAgo, to: now)!
+        _ = store.insertSpan(start: start, end: start.addingTimeInterval(600),
+                             bundleId: "x", appName: "X", title: nil, url: nil, kind: .active)
+    }
+    let wideFrom = Date(timeIntervalSince1970: 0)
+    let wideTo = now.addingTimeInterval(86_400)
+    let seededCount = store.spans(from: wideFrom, to: wideTo).count
+    check("seeded the spans this check depends on", seededCount == 25, "got \(seededCount)")
+
+    // The cutoff prune() actually computes, at the default 14-day retention:
+    // cal.date(byAdding: .day, value: -(days - 1), to: cal.startOfDay(for: Date())).
+    let days = 14
+    let cutoff = cal.date(byAdding: .day, value: -(days - 1), to: cal.startOfDay(for: now))!
+
+    let summary = await Erase.data(from: nil, to: cutoff, in: store, contents: .capturesOnly)
+    check("a .capturesOnly retention sweep reports zero spans deleted",
+          summary.spans == 0, "got \(summary.spans)")
+    // The summary and the table can disagree — it's the table that is the
+    // user's data, so that's the one that actually has to hold.
+    check("...and the spans table itself is untouched",
+          store.spans(from: wideFrom, to: wideTo).count == seededCount,
+          "got \(store.spans(from: wideFrom, to: wideTo).count), seeded \(seededCount)")
+
+    // Guard the guard: the same range under .capturesAndActivity really does
+    // take the old spans, so the checks above aren't passing because span
+    // deletion has silently stopped working for everyone.
+    let fullSummary = await Erase.data(from: nil, to: cutoff, in: store, contents: .capturesAndActivity)
+    check(".capturesAndActivity over the same range does delete the old spans",
+          fullSummary.spans > 0, "got \(fullSummary.spans)")
+    check("...leaving only the spans at or after the cutoff",
+          store.spans(from: wideFrom, to: wideTo).allSatisfy { $0.start >= cutoff },
+          "got \(store.spans(from: wideFrom, to: wideTo).map { $0.start })")
+}()
+
+// ============================================================================
+// Erase deletes only the rows whose files actually went — a capture whose
+// file won't unlink keeps its row, and is attempted at most once per erase.
+// ============================================================================
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let takenAt = Date(timeIntervalSince1970: 1_800_000_000)
+    let dayKey = Format.dayKey.string(from: takenAt)
+    let dayDir = store.screenshotsDir.appendingPathComponent(dayKey, isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+    let fullURL = dayDir.appendingPathComponent("shot.jpg")
+    try! Data([0xFF]).write(to: fullURL)
+
+    store.insertScreenshot(takenAt: takenAt, day: dayKey, displayID: 0,
+                           path: fullURL.path, thumbPath: "", isActive: false)
+
+    // unlink(2) needs write access to the *containing directory*, not the
+    // file itself — this, not a chmod on the file, is what makes the removal
+    // actually fail.
+    try! FileManager.default.setAttributes([.posixPermissions: 0o500], ofItemAtPath: dayDir.path)
+    defer {
+        // Restore before the outer temp-dir cleanup runs, or removeItem can't
+        // recurse into a folder it isn't allowed to write to, leaving an
+        // undeletable directory behind in $TMPDIR.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: dayDir.path)
+    }
+
+    let summary = await Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
+
+    check("a failed unlink is reported", summary.failedFiles >= 1, "got \(summary.failedFiles)")
+    check("a failed unlink is reported exactly once, not retried across passes — the `attempted` set",
+          summary.failedFiles == 1, "got \(summary.failedFiles)")
+    check("the file that would not unlink is still on disk",
+          FileManager.default.fileExists(atPath: fullURL.path))
+    check("the row of a capture whose file would not unlink survives",
+          !store.screenshotRows(from: nil, to: nil).isEmpty)
+    check("a failed unlink is not counted as a deleted screenshot",
+          summary.screenshots == 0, "got \(summary.screenshots)")
+}()
+
+// ============================================================================
+// Crypto.resolve — a present-but-unreadable key-check file must be treated as
+// unavailable, never as absent. Absent + .absent lookup mints a fresh key
+// over an already-sealed store; this is the interlock that stops that.
+// ============================================================================
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let checkFile = dir.appendingPathComponent(Crypto.checkFileName)
+    _ = Crypto.resolve(dataDir: dir, lookup: { .absent }, create: { .found(randomKey()) })
+    try! FileManager.default.setAttributes([.posixPermissions: 0o000], ofItemAtPath: checkFile.path)
+    defer {
+        // Restore before the outer temp-dir cleanup, same reasoning as above.
+        try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: checkFile.path)
+    }
+
+    var createCalled = false
+    let crypto = Crypto.resolve(dataDir: dir, lookup: { .absent },
+                                create: { createCalled = true; return .found(randomKey()) })
+    check("an unreadable key-check file: resolve reports unavailable, not absent",
+          !crypto.isReady)
+    check("an unreadable key-check file: create() is never called over it",
+          !createCalled)
+}
+
 // ------------------------------------------------------------------- report
 
 if failures.isEmpty {
