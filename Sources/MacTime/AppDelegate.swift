@@ -81,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [store] in
             let ownTitle = AX.focusedWindowTitle(pid: ProcessInfo.processInfo.processIdentifier)
             let front = NSWorkspace.shared.frontmostApplication
-            let frontTitle = front.map { AX.focusedWindowTitle(pid: $0.processIdentifier) ?? "<nil>" } ?? "<no front app>"
+            let frontTitle = front.map { Self.diagnosticsTitle(for: $0) } ?? "<no front app>"
             let status = """
             time: \(Date())
             axTrusted: \(AX.trusted)
@@ -92,6 +92,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             try? status.write(to: store!.dataDir.appendingPathComponent("diagnostics.txt"),
                               atomically: true, encoding: .utf8)
         }
+    }
+
+    /// The frontmost app's window title, when it is ours to write down.
+    ///
+    /// This file stays (it is permission ground truth, and M5 — dropping it —
+    /// is descoped), but it was writing that title in plaintext three seconds
+    /// after every launch, next to the now-encrypted database, consulting
+    /// neither the exclusion list nor the pause state. Settings promises an
+    /// excluded app's window titles are "never recorded"; a pause that now
+    /// survives a restart has to mean a paused launch records nothing either.
+    /// This one path made both statements false, and `Erase` already deletes
+    /// this file on "Everything" for exactly the reason it should not have been
+    /// written: erasure that leaves a window title in plain text isn't.
+    ///
+    /// The app's *name* still goes in — an excluded app is not a secret, it
+    /// just stops saying what was on screen — and the reasons are spelled out
+    /// rather than collapsed to one marker, because telling "Accessibility gave
+    /// us nothing" apart from "we chose not to write it" is the whole job of
+    /// this file.
+    ///
+    /// Routed through `CapturePolicy` instead of repeating its membership test,
+    /// so there is one exclusion rule and not a second that can drift from it —
+    /// and so an excluded app's title is never even read.
+    private static func diagnosticsTitle(for app: NSRunningApplication) -> String {
+        guard Settings.trackingEnabled else { return "<not recorded — tracking off>" }
+        guard !Settings.paused else { return "<not recorded — paused>" }
+        let bundleID = app.bundleIdentifier ?? "pid.\(app.processIdentifier)"
+        guard !Settings.excludedBundleIDs.contains(bundleID) else {
+            return "<not recorded — excluded app>"
+        }
+        return CapturePolicy.detail(for: bundleID,
+                                    excludedBundleIDs: Settings.excludedBundleIDs,
+                                    fullURLs: false) {
+            (AX.trusted ? AX.focusedWindowTitle(pid: app.processIdentifier) : nil, nil)
+        }.title ?? "<nil>"
     }
 
     func applicationWillTerminate(_ notification: Notification) {
