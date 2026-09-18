@@ -189,20 +189,32 @@ final class ScreenshotService {
     // ------------------------------------------------------------- retention
 
     private var lastPruneDay: String?
+    private var pruning = false
 
-    /// Delete day folders (and their rows) older than the retention window.
-    /// Folder names are yyyy-MM-dd, so string comparison is date comparison.
+    /// Delete captures older than the retention window.
+    ///
+    /// The cutoff is a *timestamp*. This used to compare day-folder names
+    /// against a day key lexically, which only holds while the formatter keeps
+    /// spelling days the same way — and it didn't: unpinned, `Format.dayKey`
+    /// followed the user's region, so a machine that moved to a Buddhist
+    /// calendar or Arabic-indic digits either destroyed history early
+    /// (`"2026-…" < "2569-…"`) or, worse, matched nothing ever again and kept
+    /// every screenshot forever while Settings still promised "Keep for 14
+    /// days". `taken_at` is unix seconds and says the same thing everywhere.
+    ///
+    /// Runs off the main thread (unlinking a day is hundreds of files) and only
+    /// one at a time — `start()` and the midnight tick can otherwise overlap
+    /// while a sweep is still in flight.
     func prune() {
+        guard !pruning else { return }
         let days = max(1, Settings.screenshotRetentionDays)
-        guard let cutoffDate = Calendar.current.date(byAdding: .day, value: -(days - 1),
-                                                     to: Calendar.current.startOfDay(for: Date())) else { return }
-        let cutoff = Format.dayKey.string(from: cutoffDate)
-        let fm = FileManager.default
-        guard let entries = try? fm.contentsOfDirectory(at: store.screenshotsDir,
-                                                        includingPropertiesForKeys: nil) else { return }
-        for entry in entries where entry.lastPathComponent < cutoff {
-            try? fm.removeItem(at: entry)
+        let cal = Calendar.current
+        guard let cutoff = cal.date(byAdding: .day, value: -(days - 1),
+                                    to: cal.startOfDay(for: Date())) else { return }
+        pruning = true
+        Task { @MainActor [weak self, store] in
+            await Erase.data(from: nil, to: cutoff, in: store)
+            self?.pruning = false
         }
-        store.deleteScreenshotRows(before: cutoff)
     }
 }

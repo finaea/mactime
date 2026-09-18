@@ -88,8 +88,21 @@ owns the F-row as media keys never deliver `F12` to an app at all.
 
 Everything lives in `~/Library/Application Support/MacTime/`:
 SQLite database (`MacTime.db`: activity spans + screenshot index) and
-`Screenshots/yyyy-MM-dd/` image folders. Delete the folder, lose the history —
-nothing leaves the machine.
+`Screenshots/yyyy-MM-dd/` image folders. Nothing leaves the machine.
+
+Settings → Delete data erases a single day, a date range, or everything —
+screenshots and activity history together, files as well as rows, and the
+database is compacted afterwards so the deleted rows aren't left readable in
+its free pages. Deleting the folder in Finder still works, but it leaves the
+database pointing at captures that are gone.
+
+Day folders are named `yyyy-MM-dd` in a fixed Gregorian, Latin-digit spelling
+regardless of your region. Retention and deletion both work off capture
+timestamps rather than those names — before 1.1 the folder names followed the
+system region, and comparing them meant retention could stop pruning entirely
+on a machine whose calendar or numbering system changed. Folders written under
+the old spelling are still read, and their day column is corrected on first
+launch.
 
 ## Building from source
 
@@ -97,7 +110,7 @@ Needs only Command Line Tools (no Xcode): Swift 6.1+, macOS 15 SDK.
 
 ```bash
 swift build                      # compile
-tools/run-tests.sh               # checks for the date math (Tests/)
+tools/run-tests.sh               # checks for the date math and the store (Tests/)
 tools/bundle-macos.sh            # build + assemble publish/MacTime.app + sign
 swift tools/make-icons.swift     # regenerate icns + dmg artwork
 tools/make-dmg.sh                # package the dmg

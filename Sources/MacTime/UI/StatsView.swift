@@ -62,6 +62,11 @@ struct StatsView: View {
             }
         }
         .onAppear { apply(preset: preset) }
+        // Deleting from Settings doesn't touch this view's state, so the charts
+        // would keep showing days that no longer exist.
+        .onReceive(NotificationCenter.default.publisher(for: .mactimeDataErased)) { _ in
+            reload()
+        }
     }
 
     // ------------------------------------------------------------- range header

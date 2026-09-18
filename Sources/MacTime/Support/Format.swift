@@ -27,9 +27,31 @@ enum Format {
         return f
     }()
 
-    /// yyyy-MM-dd, local timezone. Used for screenshot day folders — sorts lexically.
+    /// yyyy-MM-dd for screenshot day folders and `screenshots.day`.
+    ///
+    /// Without a locale and a calendar a fixed-format formatter emits whatever
+    /// the user's *region* dictates rather than the format string (Apple
+    /// QA1480). Both pins are needed and neither substitutes for the other: the
+    /// locale fixes the numbering system — an Arabic-indic region writes
+    /// `٢٠٢٦-٠٩-١٥` — and the calendar fixes the era, since a Buddhist-calendar
+    /// region writes `2569-09-15` in perfectly ordinary ASCII. Retention used to compare
+    /// those names lexically, so a region change either destroyed history early
+    /// or — the privacy failure — stopped matching anything at all while
+    /// Settings still promised "Keep for 14 days". Retention now works off
+    /// `taken_at`; pinning keeps the *names* stable too, and lets the ASCII
+    /// hand-parsers in TimeMath and StatsView read back what we wrote.
+    ///
+    /// The time zone is deliberately *not* pinned. "Day" means local day
+    /// everywhere else in the app — `Store.dayStats` splits spans on
+    /// `Calendar.current` midnights, `DayModel` opens on `startOfDay` — so the
+    /// formatter has to keep following the system zone. Setting the calendar
+    /// does not change that: it stays on `TimeZone.current` and its boundaries
+    /// still line up with `Calendar.current.startOfDay`.
     static let dayKey: DateFormatter = {
         let f = DateFormatter()
+        // Locale before dateFormat: assigning it can reset a format already set.
+        f.locale = Locale(identifier: "en_US_POSIX")
+        f.calendar = Calendar(identifier: .gregorian)
         f.dateFormat = "yyyy-MM-dd"
         return f
     }()

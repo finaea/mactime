@@ -19,6 +19,15 @@ struct SettingsView: View {
     @State private var loginItemError: String?
     @State private var diskUsage: String = "…"
 
+    @State private var eraseScope: EraseScope = .day
+    @State private var eraseFrom = Calendar.current.startOfDay(for: Date())
+    @State private var eraseTo = Calendar.current.startOfDay(for: Date())
+    @State private var confirmingErase = false
+    @State private var confirmTitle = ""
+    @State private var confirmMessage = ""
+    @State private var erasing = false
+    @State private var eraseResult: String?
+
     var body: some View {
         Form {
             Section("Activity tracking") {
@@ -109,10 +118,125 @@ struct SettingsView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([store.dataDir])
                 }
             }
+
+            deleteSection
         }
         .formStyle(.grouped)
         .frame(width: 500)
         .task { await computeDiskUsage() }
+        .confirmationDialog(confirmTitle, isPresented: $confirmingErase, titleVisibility: .visible) {
+            Button("Delete", role: .destructive) { Task { await performErase() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text(confirmMessage)
+        }
+    }
+
+    // ------------------------------------------------------------- delete data
+
+    /// What "Delete" is aimed at. Each resolves to a pair of timestamps, never
+    /// to a day key — see `Store`'s erasure section for why that matters.
+    private enum EraseScope: String, CaseIterable, Identifiable {
+        case day = "A single day"
+        case range = "A date range"
+        case all = "Everything"
+        var id: String { rawValue }
+    }
+
+    private var deleteSection: some View {
+        Section("Delete data") {
+            Picker("Delete", selection: $eraseScope) {
+                ForEach(EraseScope.allCases) { Text($0.rawValue).tag($0) }
+            }
+            switch eraseScope {
+            case .day:
+                DatePicker("Day", selection: $eraseFrom, in: ...Date(),
+                           displayedComponents: .date)
+            case .range:
+                DatePicker("From", selection: $eraseFrom, in: ...Date(),
+                           displayedComponents: .date)
+                DatePicker("To", selection: $eraseTo, in: ...Date(),
+                           displayedComponents: .date)
+            case .all:
+                EmptyView()
+            }
+
+            Text(eraseScope == .all
+                 ? "Removes every screenshot and the whole activity history — window titles and URLs included — and compacts the database so the deleted rows aren't left readable in it."
+                 : "Removes the screenshots and the activity history — window titles and URLs — recorded in the selected days. An activity entry that runs across the edge of the range goes with it.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            HStack {
+                Spacer()
+                if erasing {
+                    ProgressView().controlSize(.small)
+                }
+                Button("Delete…", role: .destructive) { confirmErase() }
+                    .disabled(erasing)
+            }
+            if let eraseResult {
+                Text(eraseResult).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// Half-open [from, to) the current scope stands for; nil bounds mean
+    /// unbounded, so "Everything" is nil/nil. The To picker names the last
+    /// *included* day, matching the statistics range header.
+    private var eraseRange: (from: Date?, to: Date?) {
+        let cal = Calendar.current
+        func endOf(_ d: Date) -> Date? { cal.date(byAdding: .day, value: 1, to: cal.startOfDay(for: d)) }
+        switch eraseScope {
+        case .all:
+            return (nil, nil)
+        case .day:
+            return (cal.startOfDay(for: eraseFrom), endOf(eraseFrom))
+        case .range:
+            // Pickers dragged past each other shouldn't silently erase nothing.
+            let lo = min(eraseFrom, eraseTo), hi = max(eraseFrom, eraseTo)
+            return (cal.startOfDay(for: lo), endOf(hi))
+        }
+    }
+
+    /// Count first, so the prompt names what will actually go rather than
+    /// asking the user to confirm an unknown. The title says which days, the
+    /// message says how much — "Everything" has to be unmistakably different
+    /// from "this one day" at the moment of confirming.
+    private func confirmErase() {
+        let range = eraseRange
+        let counts = store.counts(from: range.from, to: range.to)
+        eraseResult = nil
+        guard counts.screenshots + counts.spans > 0 else {
+            eraseResult = "Nothing recorded in that range."
+            return
+        }
+        switch eraseScope {
+        case .all:
+            confirmTitle = "Delete all MacTime data?"
+        case .day:
+            confirmTitle = "Delete everything recorded on \(Format.dayHeading.string(from: eraseFrom))?"
+        case .range:
+            let lo = min(eraseFrom, eraseTo), hi = max(eraseFrom, eraseTo)
+            confirmTitle = "Delete everything recorded from \(Format.dayHeading.string(from: lo)) "
+                + "to \(Format.dayHeading.string(from: hi))?"
+        }
+        confirmMessage = "\(counts.screenshots) screenshot\(counts.screenshots == 1 ? "" : "s") and "
+            + "\(counts.spans) activity entr\(counts.spans == 1 ? "y" : "ies"), including window "
+            + "titles and URLs. This can't be undone."
+        confirmingErase = true
+    }
+
+    private func performErase() async {
+        erasing = true
+        let range = eraseRange
+        let summary = await Erase.data(from: range.from, to: range.to, in: store)
+        erasing = false
+        eraseResult = summary.failedFiles == 0
+            ? "Deleted \(summary.screenshots) screenshots and \(summary.spans) activity entries."
+            : "Deleted \(summary.screenshots) screenshots and \(summary.spans) activity entries; "
+                + "\(summary.failedFiles) files couldn't be removed."
+        await computeDiskUsage()
     }
 
     /// Typed field plus a stepper — nudging by 4pt while watching the preview

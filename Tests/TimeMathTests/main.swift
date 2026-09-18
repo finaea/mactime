@@ -483,6 +483,383 @@ check("the fall-back day is 25 hours long",
       ny.date(byAdding: .day, value: 1, to: nyAt(2026, 11, 1, 0))!
         .timeIntervalSince(nyAt(2026, 11, 1, 0)) == 25 * 3600)
 
+// ============================================================================
+// Retention & erasure — Format.dayKey's pin, the day-key migration, range
+// deletion, folder sweeping, and Erase.data end to end.
+// ============================================================================
+
+// -------------------------------------------------- Format.dayKey's two pins
+//
+// Format.dayKey pins `.locale` and `.calendar` independently, and they don't
+// buy the same protection. Picked well away from any midnight so it can't
+// straddle a day boundary under any of the locales/timezones this block uses.
+do {
+    let probe = Date(timeIntervalSince1970: 1_789_000_000)
+
+    // Guard the guard: an unpinned formatter — no calendar override at all —
+    // really does write the region's calendar/digits on this ICU data, or the
+    // checks below would pass without exercising anything.
+    func unpinned(_ localeID: String) -> DateFormatter {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: localeID)
+        f.dateFormat = "yyyy-MM-dd"
+        return f
+    }
+    let thBuddhist = unpinned("th_TH").string(from: probe)
+    check("an unpinned th_TH formatter really does write a Buddhist year",
+          thBuddhist.hasPrefix("2569-"), "got \(thBuddhist)")
+    let arDigits = unpinned("ar_EG").string(from: probe)
+    check("an unpinned ar_EG formatter really does write non-ASCII digits",
+          !arDigits.allSatisfy { $0.isASCII }, "got \(arDigits)")
+
+    // The calendar pin: swapping only `.locale` on the shared, already-pinned
+    // formatter can't bring the Buddhist calendar back, because `.calendar`
+    // was set explicitly and independently of locale. This is what keeps a
+    // day-key column that was already Latin-Gregorian from drifting the
+    // moment a user's region changes, without anyone touching `.calendar`.
+    //
+    // It is *not* a guarantee against every hostile locale: numbering-system
+    // digits (ar_EG) are a locale property the calendar pin doesn't reach —
+    // that gap is exactly what the pre-existing ar_EG block below exercises,
+    // which is why this block only re-covers th_TH.
+    let savedLocale = Format.dayKey.locale
+    let originalKey = Format.dayKey.string(from: probe)
+
+    Format.dayKey.locale = Locale(identifier: "th_TH")
+    let underThLocale = Format.dayKey.string(from: probe)
+    check("swapping locale alone can't undo the pinned Gregorian calendar",
+          underThLocale == originalKey, "was \(originalKey), got \(underThLocale)")
+    check("and it still reads back in ASCII digits",
+          underThLocale.allSatisfy { $0.isASCII }, "got \(underThLocale)")
+
+    Format.dayKey.locale = savedLocale
+    check("the shared formatter writes what it wrote before the th_TH swap",
+          Format.dayKey.string(from: probe) == originalKey,
+          "was \(originalKey), now \(Format.dayKey.string(from: probe))")
+}
+
+// ------------------------------------------------------- DayKey.repairs pure
+//
+// The whole of the migration's decision, checked without a database: given
+// rows in whatever spelling, does it propose exactly the ones that disagree
+// with their own taken_at, rewritten under the pinned formatter?
+do {
+    let takenAt = Date(timeIntervalSince1970: 1_789_000_000)
+    let correct = Format.dayKey.string(from: takenAt)
+
+    check("a row already spelled correctly needs no repair — the no-op case",
+          DayKey.repairs(in: [(id: 1, takenAt: takenAt, day: correct)]).isEmpty)
+
+    let badRows: [(id: Int64, takenAt: Date, day: String)] = [
+        (1, takenAt, "2569-09-10"),       // th_TH Buddhist spelling
+        (2, takenAt, "٢٠٢٦-٠٩-١١"),       // ar_EG Arabic-indic spelling
+    ]
+    let repairs = DayKey.repairs(in: badRows)
+    check("both mis-spelled rows are proposed for repair",
+          repairs.count == 2, "got \(repairs.count)")
+    check("repairs rewrite to the pinned spelling derived from taken_at",
+          repairs.allSatisfy { $0.day == correct }, "got \(repairs)")
+    check("repairs keep the row ids they were given",
+          Set(repairs.map { $0.id }) == Set([1, 2]))
+}
+
+// -------------------------------------------------- Store's migration, live
+//
+// `Store.init` calls `migrate()` on every open, and migrate()'s last step is
+// `if db.userVersion < 1 { repairDayKeys(); db.userVersion = 1 }` — which
+// stamps version 1 the very first time any store is opened, including a
+// brand-new empty one. So seeding a fresh `Store` and simply reopening it
+// proves nothing: the second open's `userVersion < 1` is already false and
+// the migration never runs. A real pre-upgrade database predates the
+// migration entirely and sits at `user_version = 0`; `rewind` puts a freshly
+// seeded database back into exactly that state, undoing the stamp `migrate()`
+// just wrote, so reopening it exercises the real first-upgrade path.
+func makeTempStoreDir() -> URL {
+    let dir = FileManager.default.temporaryDirectory
+        .appendingPathComponent("mactime-tests-\(UUID().uuidString)", isDirectory: true)
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    return dir
+}
+
+func rewindToPreMigration(_ dir: URL) {
+    let db = Database(path: dir.appendingPathComponent("MacTime.db").path)
+    db.userVersion = 0
+    db.close()
+}
+
+func readDayColumn(_ dir: URL) -> [Int64: String] {
+    let db = Database(path: dir.appendingPathComponent("MacTime.db").path)
+    var out: [Int64: String] = [:]
+    db.run("SELECT id, day FROM screenshots") { s in
+        out[Database.int64(s, 0)] = Database.text(s, 1)
+    }
+    db.close()
+    return out
+}
+
+func readUserVersion(_ dir: URL) -> Int {
+    let db = Database(path: dir.appendingPathComponent("MacTime.db").path)
+    let v = db.userVersion
+    db.close()
+    return v
+}
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let takenAt1 = Date(timeIntervalSince1970: 1_789_000_000)
+    let takenAt2 = takenAt1.addingTimeInterval(86_400)
+    let correct1 = Format.dayKey.string(from: takenAt1)
+    let correct2 = Format.dayKey.string(from: takenAt2)
+
+    var store = Store(directory: dir)
+    store.insertScreenshot(takenAt: takenAt1, day: "2569-09-10", displayID: 0,
+                           path: "", thumbPath: "", isActive: false)
+    store.insertScreenshot(takenAt: takenAt2, day: "٢٠٢٦-٠٩-١١", displayID: 0,
+                           path: "", thumbPath: "", isActive: false)
+    store.close()
+    rewindToPreMigration(dir)   // this store now looks exactly like a pre-upgrade one
+
+    let seeded = readDayColumn(dir)
+    check("seed values really are non-Latin/non-Gregorian before the repair runs",
+          Set(seeded.values) == Set(["2569-09-10", "٢٠٢٦-٠٩-١١"]), "got \(seeded)")
+
+    store = Store(directory: dir)   // migrate() runs here, for the first real time
+    store.close()
+
+    let repaired = readDayColumn(dir)
+    check("the migration re-spells both legacy day keys under the pinned formatter",
+          Set(repaired.values) == Set([correct1, correct2]), "got \(repaired)")
+    check("user_version reaches 1 once the migration has run",
+          readUserVersion(dir) == 1)
+
+    // Reopening an already-migrated store must not re-run the repair or touch
+    // rows a second time.
+    store = Store(directory: dir)
+    store.close()
+    check("reopening an already-migrated store changes nothing",
+          readDayColumn(dir) == repaired, "got \(readDayColumn(dir))")
+}
+
+do {
+    // The case that has to stay free: a store that was always Latin-Gregorian
+    // is never touched, even when it genuinely goes through the pre-upgrade →
+    // migrate path rather than just starting at version 1.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+
+    let takenAt = Date(timeIntervalSince1970: 1_789_000_000)
+    let correct = Format.dayKey.string(from: takenAt)
+
+    var store = Store(directory: dir)
+    store.insertScreenshot(takenAt: takenAt, day: correct, displayID: 0,
+                           path: "", thumbPath: "", isActive: false)
+    store.close()
+    rewindToPreMigration(dir)
+
+    let before = readDayColumn(dir)
+    store = Store(directory: dir)
+    store.close()
+    check("a store that was always Latin-Gregorian comes back byte-identical",
+          readDayColumn(dir) == before, "got \(readDayColumn(dir)) vs \(before)")
+}
+
+// ------------------------------------------------ range deletion boundaries
+//
+// [from, to) is half-open for screenshots — a capture at `from` goes, one at
+// `to` survives, one a second before `to` goes.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let from = Date(timeIntervalSince1970: 1_789_000_000)
+    let to = from.addingTimeInterval(3600)
+
+    store.insertScreenshot(takenAt: from, day: "d", displayID: 0,
+                           path: "at-from", thumbPath: "", isActive: false)
+    store.insertScreenshot(takenAt: to, day: "d", displayID: 0,
+                           path: "at-to", thumbPath: "", isActive: false)
+    store.insertScreenshot(takenAt: to.addingTimeInterval(-1), day: "d", displayID: 0,
+                           path: "one-second-before-to", thumbPath: "", isActive: false)
+
+    let rows = store.screenshotRows(from: from, to: to)
+    let paths = Set(rows.map { $0.path })
+    check("a capture exactly at `from` is included",
+          paths.contains("at-from"))
+    check("a capture exactly at `to` is excluded — [from, to) is half-open",
+          !paths.contains("at-to"))
+    check("a capture one second before `to` is included",
+          paths.contains("one-second-before-to"))
+    check("exactly the two in-range rows are selected", rows.count == 2, "got \(rows.count)")
+    check("counts() agrees with screenshotRows()",
+          store.counts(from: from, to: to).screenshots == rows.count)
+
+    let deleted = store.deleteScreenshots(ids: rows.map { $0.id })
+    check("deleteScreenshots deletes exactly the rows it was given",
+          deleted == 2, "got \(deleted)")
+
+    let remainingAfterBounded = store.screenshotRows(from: nil, to: nil)
+    check("the row at `to` survives the bounded delete",
+          remainingAfterBounded.contains { $0.path == "at-to" })
+    check("nothing else survives the bounded delete",
+          remainingAfterBounded.count == 1, "got \(remainingAfterBounded.count)")
+
+    // One-sided bounds.
+    check("a `from`-only range reaches to the end of time",
+          store.screenshotRows(from: to, to: nil).contains { $0.path == "at-to" })
+    check("a `to`-only range reaches back to the beginning of time",
+          store.screenshotRows(from: nil, to: to.addingTimeInterval(1))
+            .contains { $0.path == "at-to" })
+
+    // nil/nil: delete everything.
+    let deletedAll = store.deleteScreenshots(ids: store.screenshotRows(from: nil, to: nil).map { $0.id })
+    check("nil/nil selects and deletes what's left",
+          deletedAll == 1, "got \(deletedAll)")
+    check("nothing remains after an unbounded delete",
+          store.screenshotRows(from: nil, to: nil).isEmpty)
+}
+
+// deleteSpans is overlap, not containment, and deliberately so — a span
+// carries one title for its whole length, so a span reaching into an erased
+// range describes the erased range too.
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    let from = Date(timeIntervalSince1970: 1_789_000_000)
+    let to = from.addingTimeInterval(3600)
+
+    // Straddles the left edge: starts before `from`, ends inside the range —
+    // must be taken.
+    let straddleId = store.insertSpan(start: from.addingTimeInterval(-60), end: from.addingTimeInterval(60),
+                                      bundleId: "a", appName: "A", title: nil, url: nil, kind: .active)
+    // Ends exactly at `from`: `end > from` is false, so it merely touches and
+    // must survive.
+    let touchId = store.insertSpan(start: from.addingTimeInterval(-120), end: from,
+                                   bundleId: "b", appName: "B", title: nil, url: nil, kind: .active)
+
+    let deleted = store.deleteSpans(from: from, to: to)
+    check("a span straddling the left edge is deleted (overlap, not containment)",
+          deleted == 1, "got \(deleted)")
+
+    let remaining = store.spans(from: Date(timeIntervalSince1970: 0),
+                                to: Date(timeIntervalSince1970: 2_000_000_000))
+    check("a span that only touches `from` (end == from) survives — `end > from` is strict",
+          remaining.contains { $0.id == touchId })
+    check("the straddling span is really gone",
+          !remaining.contains { $0.id == straddleId })
+}
+
+// -------------------------------------------------------------- DayKey.sweep
+do {
+    let sweepCal: Calendar = {
+        var c = Calendar(identifier: .gregorian)
+        c.timeZone = TimeZone(identifier: "America/New_York")!
+        return c
+    }()
+    let todayKey = "2026-09-16"
+    let from = sweepCal.date(from: DateComponents(year: 2026, month: 9, day: 10))!
+    let to = sweepCal.date(from: DateComponents(year: 2026, month: 9, day: 15))!
+
+    check(".DS_Store — not a directory — is left alone whatever the range",
+          DayKey.sweep(entry: ".DS_Store", isDirectory: false, isEmpty: true,
+                       from: nil, to: nil, todayKey: todayKey, calendar: sweepCal) == .keep)
+
+    check("a non-day-shaped directory is left alone whatever the range",
+          DayKey.sweep(entry: "Thumbnails", isDirectory: true, isEmpty: true,
+                       from: nil, to: nil, todayKey: todayKey, calendar: sweepCal) == .keep)
+
+    check("an empty day folder is removed",
+          DayKey.sweep(entry: "2026-09-12", isDirectory: true, isEmpty: true,
+                       from: from, to: to, todayKey: todayKey, calendar: sweepCal) == .removeEmpty)
+
+    check("today's folder is kept even when empty — capture just created it",
+          DayKey.sweep(entry: todayKey, isDirectory: true, isEmpty: true,
+                       from: nil, to: nil, todayKey: todayKey, calendar: sweepCal) == .keep)
+
+    check("a non-empty folder wholly inside the range is removed",
+          DayKey.sweep(entry: "2026-09-12", isDirectory: true, isEmpty: false,
+                       from: from, to: to, todayKey: todayKey, calendar: sweepCal) == .removeCovered)
+
+    check("a non-empty folder only partly overlapping the range is kept",
+          DayKey.sweep(entry: "2026-09-14", isDirectory: true, isEmpty: false,
+                       from: from,
+                       to: sweepCal.date(from: DateComponents(year: 2026, month: 9, day: 14, hour: 12))!,
+                       todayKey: todayKey, calendar: sweepCal) == .keep,
+          "day 14 only half falls inside [from, to)")
+
+    // Legacy spellings: looksLikeDayFolder accepts them (digits are digits in
+    // any numbering system), but a bounded range needs startOfDay to prove
+    // containment, and that reads ASCII only.
+    for legacy in ["٢٠٢٦-٠٩-١٥", "2569-09-15"] {
+        check("a non-empty legacy-spelled folder (\(legacy)) is kept for a bounded range",
+              DayKey.sweep(entry: legacy, isDirectory: true, isEmpty: false,
+                           from: from, to: to, todayKey: todayKey, calendar: sweepCal) == .keep)
+        check("but removed outright when both bounds are nil (\(legacy))",
+              DayKey.sweep(entry: legacy, isDirectory: true, isEmpty: false,
+                           from: nil, to: nil, todayKey: todayKey, calendar: sweepCal) == .removeCovered)
+    }
+}
+
+// ------------------------------------------------------- Erase.data, live
+//
+// The one place that removes both halves of a capture, against a real temp
+// store with real files on disk.
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+
+    let takenAt = Date(timeIntervalSince1970: 1_789_000_000)
+    let dayKey = Format.dayKey.string(from: takenAt)
+    let dayDir = store.screenshotsDir.appendingPathComponent(dayKey, isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+
+    let fullURL = dayDir.appendingPathComponent("shot.jpg")
+    let thumbURL = dayDir.appendingPathComponent("shot.thumb.jpg")
+    try! Data([0xFF]).write(to: fullURL)
+    try! Data([0xFE]).write(to: thumbURL)
+
+    // Sits alongside the day folders, not inside one — proves the sweep only
+    // ever touches entries that look like a day folder.
+    let dsStore = store.screenshotsDir.appendingPathComponent(".DS_Store")
+    try! Data().write(to: dsStore)
+
+    store.insertScreenshot(takenAt: takenAt, day: dayKey, displayID: 0,
+                           path: fullURL.path, thumbPath: thumbURL.path, isActive: false)
+    _ = store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
+                         bundleId: "x", appName: "X", title: nil, url: nil, kind: .active)
+
+    let summary = await Erase.data(from: nil, to: nil, in: store)
+
+    check("erase-all reports the one screenshot it deleted",
+          summary.screenshots == 1, "got \(summary.screenshots)")
+    check("erase-all reports the one span it deleted",
+          summary.spans == 1, "got \(summary.spans)")
+    check("erase-all reports no unlink failures",
+          summary.failedFiles == 0, "got \(summary.failedFiles)")
+
+    check("the full-res file was unlinked",
+          !FileManager.default.fileExists(atPath: fullURL.path))
+    check("the thumbnail file was unlinked",
+          !FileManager.default.fileExists(atPath: thumbURL.path))
+    check("the emptied day folder was removed",
+          !FileManager.default.fileExists(atPath: dayDir.path))
+    check("a .DS_Store alongside the day folders is left untouched",
+          FileManager.default.fileExists(atPath: dsStore.path))
+    check("the screenshot row is gone",
+          store.screenshotRows(from: nil, to: nil).isEmpty)
+    check("the span row is gone",
+          store.spans(from: Date(timeIntervalSince1970: 0), to: Date(timeIntervalSince1970: 2_000_000_000)).isEmpty)
+
+    store.close()
+}()
+
 // ------------------------------------------------------------------- report
 
 if failures.isEmpty {

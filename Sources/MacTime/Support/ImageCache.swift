@@ -16,6 +16,12 @@ enum ImageCache {
         cache.object(forKey: path as NSString)
     }
 
+    /// Drop everything after an erase — a cached image outlives the file it was
+    /// read from, and paths repeat (they are timestamps).
+    static func clear() {
+        cache.removeAllObjects()
+    }
+
     static func image(path: String) async -> NSImage? {
         if let hit = cached(path: path) { return hit }
         let loaded = await Task.detached(priority: .utility) { NSImage(contentsOfFile: path) }.value

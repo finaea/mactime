@@ -59,9 +59,13 @@ final class Store {
     let screenshotsDir: URL
     private let db: Database
 
-    init() {
+    /// `directory` is only ever passed by the checks in Tests/, which need a
+    /// store they can create, fill and throw away — the app always takes the
+    /// default. Retention and erasure delete files, so exercising them against
+    /// `~/Library/Application Support/MacTime` is not an option.
+    init(directory: URL? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        dataDir = appSupport.appendingPathComponent("MacTime", isDirectory: true)
+        dataDir = directory ?? appSupport.appendingPathComponent("MacTime", isDirectory: true)
         screenshotsDir = dataDir.appendingPathComponent("Screenshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
         db = Database(path: dataDir.appendingPathComponent("MacTime.db").path)
@@ -103,6 +107,42 @@ final class Store {
         if !columnExists(table: "screenshots", column: "is_active") {
             db.exec("ALTER TABLE screenshots ADD COLUMN is_active INTEGER NOT NULL DEFAULT 0;")
         }
+
+        if db.userVersion < 1 {
+            repairDayKeys()
+            db.userVersion = 1
+        }
+    }
+
+    /// Rewrite `screenshots.day` values the old unpinned `Format.dayKey` wrote.
+    ///
+    /// Before it was pinned the formatter followed the user's region, so a
+    /// Buddhist-calendar or Arabic-indic machine filled this column with
+    /// `2569-09-15` / `٢٠٢٦-٠٩-١٥`. Nothing reads `day` for retention any more
+    /// — that moved onto `taken_at` — but leaving two spellings in one column
+    /// is a trap for anything written against it later, and the column is the
+    /// only human-readable index this table has.
+    ///
+    /// `taken_at` is a unix timestamp, so it is the same number in every
+    /// region: it, not the old string, decides. On a store that was always
+    /// Latin-Gregorian every row already agrees and this writes nothing, which
+    /// is the case that has to stay free. Runs once, gated on `user_version`.
+    private func repairDayKeys() {
+        var rows: [(id: Int64, takenAt: Date, day: String)] = []
+        db.run("SELECT id, taken_at, day FROM screenshots") { s in
+            rows.append((Database.int64(s, 0),
+                         Date(timeIntervalSince1970: Database.double(s, 1)),
+                         Database.text(s, 2) ?? ""))
+        }
+        let repairs = DayKey.repairs(in: rows)
+        guard !repairs.isEmpty else { return }
+        db.exec("BEGIN;")
+        for repair in repairs {
+            db.run("UPDATE screenshots SET day = ? WHERE id = ?", bind: [repair.day, repair.id])
+        }
+        db.exec("COMMIT;")
+        NSLog("MacTime: re-spelled %d screenshot day keys under the pinned formatter",
+              repairs.count)
     }
 
     private func columnExists(table: String, column: String) -> Bool {
@@ -263,6 +303,10 @@ final class Store {
 
     // ------------------------------------------------------------- screenshots
 
+    /// `day` mirrors the folder the files landed in. It is provenance only —
+    /// nothing queries it, because a day key is a name and names were once
+    /// spelled per-region (see `Format.dayKey`). Anything selecting a time
+    /// range uses `taken_at`.
     func insertScreenshot(takenAt: Date, day: String, displayID: Int, path: String,
                           thumbPath: String, isActive: Bool) {
         db.run("""
@@ -289,11 +333,6 @@ final class Store {
         return out
     }
 
-    /// Delete rows for day keys strictly before `dayKey`. Files are the caller's job.
-    func deleteScreenshotRows(before dayKey: String) {
-        db.run("DELETE FROM screenshots WHERE day < ?", bind: [dayKey])
-    }
-
     /// Delete one screenshot row (viewer's Delete action). Files are the caller's job.
     func deleteScreenshot(id: Int64) {
         db.run("DELETE FROM screenshots WHERE id = ?", bind: [id])
@@ -304,5 +343,95 @@ final class Store {
         var n = 0
         db.run("SELECT COUNT(*) FROM screenshots") { s in n = Int(Database.int64(s, 0)) }
         return n
+    }
+
+    // ------------------------------------------------------------- erasure
+    //
+    // Retention and "delete my data" both live on these. Every one of them
+    // takes timestamps, never a day key: `screenshots.day` and the folder names
+    // it mirrors are *names*, written by a formatter that used to follow the
+    // user's region, and comparing them is what let retention silently stop
+    // pruning (see `Format.dayKey`). `taken_at` and `start` are unix seconds
+    // and mean the same thing in every region.
+    //
+    // A nil bound is unbounded — bound as an infinity rather than built into
+    // the SQL, so these stay single constant statements with no interpolation.
+
+    private static func lower(_ d: Date?) -> Double { d?.timeIntervalSince1970 ?? -.greatestFiniteMagnitude }
+    private static func upper(_ d: Date?) -> Double { d?.timeIntervalSince1970 ?? .greatestFiniteMagnitude }
+
+    /// Captures in [from, to), with the files each one owns.
+    func screenshotRows(from: Date?, to: Date?) -> [(id: Int64, path: String, thumbPath: String)] {
+        var out: [(Int64, String, String)] = []
+        db.run("SELECT id, path, thumb_path FROM screenshots WHERE taken_at >= ? AND taken_at < ?",
+               bind: [Self.lower(from), Self.upper(to)]) { s in
+            out.append((Database.int64(s, 0), Database.text(s, 1) ?? "", Database.text(s, 2) ?? ""))
+        }
+        return out
+    }
+
+    /// Delete exactly these capture rows. Files are the caller's job.
+    ///
+    /// By id rather than by range because the caller unlinks the files first,
+    /// and capture keeps running while it does: deleting by range would also
+    /// take a row inserted since the read, leaving its JPEG on disk with
+    /// nothing left pointing at it — an orphan retention can no longer find.
+    @discardableResult
+    func deleteScreenshots(ids: [Int64]) -> Int {
+        var deleted = 0
+        // Chunked to stay clear of SQLite's bound-variable limit. The statement
+        // is built from a count, never from anything a user typed.
+        for chunk in stride(from: 0, to: ids.count, by: 500).map({
+            Array(ids[$0..<min($0 + 500, ids.count)])
+        }) {
+            let holes = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            db.run("DELETE FROM screenshots WHERE id IN (\(holes))", bind: chunk)
+            deleted += db.changes
+        }
+        return deleted
+    }
+
+    /// Delete every activity span *overlapping* [from, to).
+    ///
+    /// Overlap, not containment: a span carries one title and one URL for its
+    /// whole length, so a span that reaches into an erased range describes the
+    /// erased range too. Erring the other way would leave "delete this day"
+    /// holding the titles of that day inside a span that started the evening
+    /// before, which is not erasure. The cost is that erasing one day can take
+    /// a span with it that also covered its neighbour — the honest trade for a
+    /// feature whose whole job is that the data is gone.
+    @discardableResult
+    func deleteSpans(from: Date?, to: Date?) -> Int {
+        db.run("DELETE FROM activity_spans WHERE end > ? AND start < ?",
+               bind: [Self.lower(from), Self.upper(to)])
+        return db.changes
+    }
+
+    /// What an erase would take, for the confirmation prompt.
+    func counts(from: Date?, to: Date?) -> (screenshots: Int, spans: Int) {
+        var shots = 0, spans = 0
+        db.run("SELECT COUNT(*) FROM screenshots WHERE taken_at >= ? AND taken_at < ?",
+               bind: [Self.lower(from), Self.upper(to)]) { s in shots = Int(Database.int64(s, 0)) }
+        db.run("SELECT COUNT(*) FROM activity_spans WHERE end > ? AND start < ?",
+               bind: [Self.lower(from), Self.upper(to)]) { s in spans = Int(Database.int64(s, 0)) }
+        return (shots, spans)
+    }
+
+    /// Give back the pages a delete freed, instead of leaving the deleted rows
+    /// legible in the file's free list — which is the whole point of an erase.
+    ///
+    /// The checkpoint either side is not optional: the database runs in WAL
+    /// mode, so recent activity lives in `MacTime.db-wal` rather than in the
+    /// file VACUUM rewrites. Truncating the WAL first folds it in; VACUUM's own
+    /// rewrite then lands right back in a fresh WAL, so the second truncate is
+    /// what actually leaves the bytes only in the compacted main file. (`-shm`
+    /// is a scratch index for the WAL and holds no row data; it is rebuilt.)
+    ///
+    /// Cheap enough for the main thread — this database is a few MB even at
+    /// 90-day retention; the slow half of an erase is unlinking the JPEGs.
+    func compact() {
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE);")
+        db.exec("VACUUM;")
+        db.exec("PRAGMA wal_checkpoint(TRUNCATE);")
     }
 }

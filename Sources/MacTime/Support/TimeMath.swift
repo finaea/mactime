@@ -29,19 +29,14 @@ func hourOfDay(_ date: Date, dayKey: String, calendar cal: Calendar = .current) 
 ///
 /// Read by hand first, because that is what makes the calendar — and with it the
 /// timezone — injectable, and a pinned calendar is the only way to write a check
-/// for a DST day at all. But `Int()` reads ASCII digits only, while the keys the
-/// app actually stores come out of `Format.dayKey`, which has no fixed locale and
-/// so emits whatever numbering system the user's locale uses (`٢٠٢٦-٠٩-١٦` under
-/// `ar_EG`). Those have to go back through the formatter that wrote them, or
-/// `hourOfDay` silently falls back to the timestamp's own day and draws the
-/// midnight-crossing bar wrong for exactly those users.
+/// for a DST day at all. `Format.dayKey` is pinned to `en_US_POSIX` now, so that
+/// hand parse covers everything the app writes; the formatter fallback stays for
+/// anything that reaches here spelled some other way, because losing the parse
+/// silently falls back to the timestamp's own day and draws the midnight-crossing
+/// bar wrong for exactly those callers.
 private func startOfDay(forKey dayKey: String, calendar cal: Calendar) -> Date? {
-    let parts = dayKey.split(separator: "-")
-    if parts.count == 3, let y = Int(parts[0]), let m = Int(parts[1]), let d = Int(parts[2]),
-       let date = cal.date(from: DateComponents(year: y, month: m, day: d)) {
-        return cal.startOfDay(for: date)
-    }
-    return Format.dayKey.date(from: dayKey).map { cal.startOfDay(for: $0) }
+    DayKey.startOfDay(forKey: dayKey, calendar: cal)
+        ?? Format.dayKey.date(from: dayKey).map { cal.startOfDay(for: $0) }
 }
 
 /// From/To math for the statistics range header.

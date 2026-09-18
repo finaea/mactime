@@ -490,6 +490,7 @@ final class DayModel: ObservableObject {
 
     private var refreshTimer: Timer?
     private var wakeObserver: NSObjectProtocol?
+    private var eraseObserver: NSObjectProtocol?
     /// The shown day was today when it was picked, so it should follow the clock
     /// across midnight. Cleared once the user browses to some other day.
     private var followingToday = true
@@ -507,12 +508,25 @@ final class DayModel: ObservableObject {
         ) { [weak self] _ in
             self?.refresh()
         }
+        // Deleting from Settings doesn't go through this model, so without this
+        // the day keeps drawing rows — and thumbnails — that are gone. Reloads
+        // the day on screen rather than rolling it over, whatever day that is.
+        eraseObserver = NotificationCenter.default.addObserver(
+            forName: .mactimeDataErased, object: nil, queue: .main
+        ) { [weak self] _ in
+            self?.viewerMode = .closed
+            self?.lastLiveShot = nil
+            self?.load()
+        }
     }
 
     deinit {
         refreshTimer?.invalidate()
         if let wakeObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(wakeObserver)
+        }
+        if let eraseObserver {
+            NotificationCenter.default.removeObserver(eraseObserver)
         }
     }
 

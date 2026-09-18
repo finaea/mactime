@@ -62,6 +62,21 @@ final class Database {
 
     var lastInsertId: Int64 { sqlite3_last_insert_rowid(handle) }
 
+    /// Rows the last INSERT/UPDATE/DELETE touched — what the erase actions
+    /// report back to the user.
+    var changes: Int { Int(sqlite3_changes(handle)) }
+
+    /// Schema generation, for migrations that can't be expressed as "does this
+    /// column exist". Stored in the file header, so it costs no table.
+    var userVersion: Int {
+        get {
+            var v = 0
+            run("PRAGMA user_version;") { s in v = Int(Database.int64(s, 0)) }
+            return v
+        }
+        set { exec("PRAGMA user_version = \(newValue);") }
+    }
+
     // Column readers
     static func text(_ s: OpaquePointer, _ col: Int32) -> String? {
         sqlite3_column_text(s, col).map { String(cString: $0) }
