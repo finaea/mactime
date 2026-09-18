@@ -411,7 +411,11 @@ struct SettingsView: View {
     private func performErase() async {
         erasing = true
         let range = eraseRange
-        let summary = await Erase.data(from: range.from, to: range.to, in: store)
+        // The user asked for this one, named the range and confirmed a count, so
+        // it takes both halves — unlike the retention sweep, which is on a timer
+        // nobody confirms and takes captures only.
+        let summary = await Erase.data(from: range.from, to: range.to, in: store,
+                                       contents: .capturesAndActivity)
         erasing = false
         eraseResult = summary.failedFiles == 0
             ? "Deleted \(summary.screenshots) screenshots and \(summary.spans) activity entries."

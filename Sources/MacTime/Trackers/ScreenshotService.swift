@@ -277,6 +277,15 @@ final class ScreenshotService {
 
     /// Delete captures older than the retention window.
     ///
+    /// Captures, and nothing else. It shares `Erase.data` with Settings' "Delete
+    /// data", which was the right call — they are one operation over different
+    /// ranges — but for a while it shared the *whole* of it, so the screenshot
+    /// retention picker quietly deleted the activity history too: window titles
+    /// and URLs, on a schedule, governed by a control that sits under
+    /// "Screenshots" and says nothing about either. Deleting activity on a
+    /// timer is finding H1 and the user descoped it, so `.capturesOnly` is not
+    /// an optimisation here — it is the whole contract.
+    ///
     /// The cutoff is a *timestamp*. This used to compare day-folder names
     /// against a day key lexically, which only holds while the formatter keeps
     /// spelling days the same way — and it didn't: unpinned, `Format.dayKey`
@@ -297,7 +306,7 @@ final class ScreenshotService {
                                     to: cal.startOfDay(for: Date())) else { return }
         pruning = true
         Task { @MainActor [weak self, store] in
-            await Erase.data(from: nil, to: cutoff, in: store)
+            await Erase.data(from: nil, to: cutoff, in: store, contents: .capturesOnly)
             self?.pruning = false
         }
     }

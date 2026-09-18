@@ -836,7 +836,7 @@ await { () async -> Void in
     _ = store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
                          bundleId: "x", appName: "X", title: nil, url: nil, kind: .active)
 
-    let summary = await Erase.data(from: nil, to: nil, in: store)
+    let summary = await Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
 
     check("erase-all reports the one screenshot it deleted",
           summary.screenshots == 1, "got \(summary.screenshots)")
@@ -1479,7 +1479,7 @@ await { () async -> Void in
     store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
                      bundleId: "x", appName: "X", title: "Sealed span", url: nil, kind: .active)
 
-    let summary = await Erase.data(from: nil, to: nil, in: store)
+    let summary = await Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
     check("erase-all with a sealed capture on disk still deletes its screenshot row",
           summary.screenshots == 1, "got \(summary.screenshots)")
     check("erase-all with a sealed capture on disk still deletes its span row",
@@ -1503,7 +1503,8 @@ await { () async -> Void in
     store.insertScreenshot(takenAt: takenAt, day: Format.dayKey.string(from: takenAt),
                            displayID: 0, path: "", thumbPath: "", isActive: false)
 
-    _ = await Erase.data(from: takenAt, to: takenAt.addingTimeInterval(3600), in: store)
+    _ = await Erase.data(from: takenAt, to: takenAt.addingTimeInterval(3600), in: store,
+                                 contents: .capturesAndActivity)
     check("a ranged erase leaves the key-check file alone",
           FileManager.default.fileExists(atPath: checkFile.path))
 

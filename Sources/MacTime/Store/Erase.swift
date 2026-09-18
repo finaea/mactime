@@ -13,6 +13,25 @@ extension Notification.Name {
 /// The one place that removes *both* halves of a capture. `Store` deletes rows;
 /// the JPEGs, the day folders and the freed database pages are handled here.
 enum Erase {
+    /// What an erase is allowed to take.
+    ///
+    /// Retention and the user's "Delete data" are the same operation over a
+    /// different range — but deliberately *not* over the same tables. Deleting
+    /// the activity history on a schedule is finding H1, which the user
+    /// descoped; it must not arrive as a side effect of reusing this function
+    /// for the daily sweep. It is a required argument and not a defaulted one
+    /// precisely because that is how it got in: the call site said nothing, and
+    /// nothing made it say.
+    enum Contents {
+        /// Captures and the activity history — window titles and URLs with them.
+        /// What "Delete data" in Settings means.
+        case capturesAndActivity
+        /// Screenshots only. What the "Keep for" picker means, and all it has
+        /// ever claimed to mean: it lives under Screenshots and says nothing
+        /// about window titles, so it does not get to delete them.
+        case capturesOnly
+    }
+
     struct Summary {
         let screenshots: Int
         let spans: Int
@@ -21,7 +40,7 @@ enum Erase {
         let failedFiles: Int
     }
 
-    /// Erase everything in [from, to); a nil bound is unbounded, so nil/nil is
+    /// Erase `contents` in [from, to); a nil bound is unbounded, so nil/nil is
     /// "delete all data".
     ///
     /// Unlinks each capture's files before deleting its row, so a crash in
@@ -34,7 +53,8 @@ enum Erase {
     /// files and an erase-everything is tens of thousands.
     @MainActor
     @discardableResult
-    static func data(from: Date?, to: Date?, in store: Store) async -> Summary {
+    static func data(from: Date?, to: Date?, in store: Store,
+                     contents: Contents) async -> Summary {
         // Hold capture off for the whole erase. `defer` and not a pair of calls
         // at top and bottom: there are early returns below, and a hold that
         // leaks is a tracker that has quietly stopped recording with nothing
@@ -43,7 +63,10 @@ enum Erase {
         defer { CaptureSuspension.end() }
 
         let dir = store.screenshotsDir
-        let everything = from == nil && to == nil
+        // An erase that is leaving the activity history behind is not
+        // "everything", whatever its range says, so it does not get to take the
+        // things below that only a full wipe may take.
+        let everything = from == nil && to == nil && contents == .capturesAndActivity
         // Read here: `Format.dayKey` is shared mutable state and the sweep runs
         // off the main thread.
         let todayKey = Format.dayKey.string(from: Date())
@@ -74,7 +97,8 @@ enum Erase {
             }.value
             screenshots += store.deleteScreenshots(ids: rows.map { $0.id })
         }
-        let spans = store.deleteSpans(from: from, to: to)
+        // Retention deletes captures and stops. See `Contents`.
+        let spans = contents == .capturesAndActivity ? store.deleteSpans(from: from, to: to) : 0
 
         await Task.detached(priority: .utility) {
             sweepFolders(in: dir, from: from, to: to, todayKey: todayKey)
