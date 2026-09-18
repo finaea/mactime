@@ -141,14 +141,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             item.target = self
         }
         statusItem.menu = menu
+        // Pause outlives the process now, so the menu bar has to be able to
+        // say so at launch and not only after a click. An app that comes up
+        // paused while still showing the recording icon is telling the user
+        // the one thing it must never get wrong.
+        renderPauseState()
     }
 
     @objc private func openMain() { showMainWindow() }
 
     @objc private func togglePause() {
         let paused = !activity.isPaused
+        // Both, deliberately: they share the stored value, but each has its own
+        // work to do on the way — closing the open span, cancelling the round
+        // in flight, and asking for the permissions a paused launch withheld.
         activity.isPaused = paused
         screenshots.isPaused = paused
+        renderPauseState()
+    }
+
+    private func renderPauseState() {
+        let paused = activity.isPaused
         pauseMenuItem?.title = paused ? "Resume Tracking" : "Pause Tracking"
         statusItem.button?.image = paused
             ? NSImage(systemSymbolName: "pause.circle", accessibilityDescription: "MacTime paused")

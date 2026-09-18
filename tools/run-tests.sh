@@ -13,6 +13,9 @@
 # DataKeychain.swift is compiled but must never be *called*: the checks build
 # their own key and pass it to Store, because a check run must not read the key
 # the real store is sealed with, and must certainly not be what creates it.
+# Settings.swift carries the same hazard and the same answer — point
+# `Settings.d` at a throwaway suite before touching it, so a check run can't
+# read or overwrite the user's real settings.
 # tools/typecheck.sh covers the SwiftUI files this can't reach.
 set -euo pipefail
 
@@ -26,6 +29,7 @@ swiftc -swift-version 5 -target arm64-apple-macos15.0 \
     Sources/MacTime/Support/DayKey.swift \
     Sources/MacTime/Support/URLPolicy.swift \
     Sources/MacTime/Support/CapturePolicy.swift \
+    Sources/MacTime/Support/Settings.swift \
     Sources/MacTime/Support/TimeMath.swift \
     Sources/MacTime/Support/ImageCache.swift \
     Sources/MacTime/Store/Database.swift \

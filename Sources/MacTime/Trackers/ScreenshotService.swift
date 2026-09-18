@@ -16,21 +16,42 @@ final class ScreenshotService {
     private var loggedKeyUnavailable = false
     private let encodeQueue = DispatchQueue(label: "mactime.screenshot.encode", qos: .utility)
 
+    /// Backed by `Settings` rather than held here, so a pause survives a quit,
+    /// a crash and a reboot — see `Settings.Key.paused`.
+    ///
     /// Pausing has to reach the round already in flight, not just the next one:
     /// a capture started a moment earlier would otherwise still land on disk
     /// (and in the database) seconds after the user asked us to stop.
-    var isPaused = false {
-        didSet { if isPaused { captureTask?.cancel() } }
+    var isPaused: Bool {
+        get { Settings.paused }
+        set {
+            Settings.setPaused(newValue)
+            if newValue {
+                captureTask?.cancel()
+            } else {
+                // Resuming is the moment to ask for what a paused launch
+                // deliberately didn't.
+                requestPermissionIfNeeded()
+            }
+        }
     }
 
     init(store: Store) {
         self.store = store
     }
 
-    func start() {
+    /// Split out of `start()` because a launch that comes up paused must not
+    /// prompt: quitting while paused and being asked for Screen Recording on
+    /// the way back in — for recording that is not going to happen — reads as
+    /// the app ignoring the pause, which is the whole of what H5 was about.
+    func requestPermissionIfNeeded() {
         if Settings.screenshotsEnabled, !CGPreflightScreenCaptureAccess() {
             CGRequestScreenCaptureAccess()
         }
+    }
+
+    func start() {
+        if !isPaused { requestPermissionIfNeeded() }
         // Fixed 5s heartbeat; the actual capture interval is read from Settings each
         // time, so changing it in Settings needs no timer rebuild.
         let t = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -48,10 +69,23 @@ final class ScreenshotService {
     }
 
     private func tick() {
+        let now = Date()
+
+        // Retention first, and above every guard below it, because none of them
+        // is a reason to stop deleting. Pause especially: it used to be
+        // in-memory and so never lasted, but a pause that survives a reboot can
+        // last a week, and a week of not pruning is a week of captures kept
+        // past the window Settings still promises in the same breath. The same
+        // argument the key-unavailable branch below makes, for the same reason.
+        let day = Format.dayKey.string(from: now)
+        if day != lastPruneDay {
+            lastPruneDay = day
+            prune()
+        }
+
         guard Settings.screenshotsEnabled, !isPaused, !capturing else { return }
         guard !Self.isScreenLocked else { return }
         guard IdleMonitor.secondsSinceLastInput() < Settings.idleThresholdSeconds else { return }
-        let now = Date()
         if let last = lastCaptureAt, now.timeIntervalSince(last) < Settings.screenshotIntervalSeconds {
             return
         }
@@ -60,9 +94,9 @@ final class ScreenshotService {
         // clear is exactly the problem encryption exists to fix, so dropping
         // the round is the lesser harm — and it is checked here, below the
         // interval test, so the compositor is never asked for a 5K frame that
-        // is only going to be thrown away. Retention below still runs: leaving
-        // captures past their window because the key went missing would be a
-        // second failure on top of the first.
+        // is only going to be thrown away. Retention sits above all of this and
+        // runs anyway: leaving captures past their window because the key went
+        // missing would be a second failure on top of the first.
         if Crypto.shared.isReady {
             capturing = true
             captureTask = Task { @MainActor in
@@ -73,13 +107,6 @@ final class ScreenshotService {
             loggedKeyUnavailable = true
             NSLog("MacTime: not capturing — %@",
                   Crypto.shared.unavailableReason ?? "no data key")
-        }
-
-        // Prune once a day, on the first tick past midnight.
-        let day = Format.dayKey.string(from: now)
-        if day != lastPruneDay {
-            lastPruneDay = day
-            prune()
         }
     }
 

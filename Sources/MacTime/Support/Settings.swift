@@ -2,11 +2,16 @@ import Foundation
 
 /// UserDefaults-backed settings. Keys are shared with @AppStorage in SettingsView.
 enum Settings {
-    private static let d = UserDefaults.standard
+    /// `UserDefaults.standard` in the app. A `var` for the same reason
+    /// `Store.init` takes a directory: the checks in Tests/ point this at a
+    /// throwaway suite, because a check run must not read the user's real
+    /// settings and must certainly not write them.
+    nonisolated(unsafe) static var d = UserDefaults.standard
 
     static func registerDefaults() {
         d.register(defaults: [
             Key.trackingEnabled: true,
+            Key.paused: false,
             Key.browserTrackingEnabled: true,
             Key.captureFullURLs: false,
             Key.excludedBundleIDs: [String](),
@@ -33,6 +38,11 @@ enum Settings {
         static let hoverPreviewOffsetX = "hoverPreviewOffsetX"
         static let hoverPreviewOffsetY = "hoverPreviewOffsetY"
         static let trackingEnabled = "trackingEnabled"
+        /// Recording paused by the user. Persisted, because in memory it meant
+        /// a quit, a crash or a reboot silently resumed: pause for a sensitive
+        /// call, reboot an hour later, and you are being recorded again with
+        /// nothing anywhere saying so.
+        static let paused = "paused"
         static let browserTrackingEnabled = "browserTrackingEnabled"
         /// false — keep only a URL's origin (`https://mail.google.com`).
         /// true  — keep the whole thing, query string included. Opt-in, and off
@@ -52,6 +62,13 @@ enum Settings {
     }
 
     static var trackingEnabled: Bool { d.bool(forKey: Key.trackingEnabled) }
+
+    /// The one copy of the pause state. Both trackers read it rather than each
+    /// keeping a flag, so a pause set anywhere is a pause everywhere — and it
+    /// is still set on the next launch.
+    static var paused: Bool { d.bool(forKey: Key.paused) }
+    static func setPaused(_ paused: Bool) { d.set(paused, forKey: Key.paused) }
+
     static var browserTrackingEnabled: Bool { d.bool(forKey: Key.browserTrackingEnabled) }
     static var captureFullURLs: Bool { d.bool(forKey: Key.captureFullURLs) }
 

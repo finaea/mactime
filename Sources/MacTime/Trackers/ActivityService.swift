@@ -12,8 +12,21 @@ final class ActivityService {
     private var tickCount = 0
     private var lastTickAt: Date?
 
-    var isPaused = false {
-        didSet { if isPaused { closeCurrent(at: Date()) } }
+    /// Backed by `Settings` rather than held here, so a pause survives a quit,
+    /// a crash and a reboot — see `Settings.Key.paused`. Both trackers read the
+    /// same stored value, so neither can be left out of step with the other.
+    var isPaused: Bool {
+        get { Settings.paused }
+        set {
+            Settings.setPaused(newValue)
+            if newValue {
+                closeCurrent(at: Date())
+            } else {
+                // Resuming is the moment to ask for what a paused launch
+                // deliberately didn't.
+                requestPermissionIfNeeded()
+            }
+        }
     }
 
     /// Whether we should be recording at all. Ticks check this, but so do the
@@ -48,8 +61,15 @@ final class ActivityService {
         self.store = store
     }
 
-    func start() {
+    /// Split out of `start()` because a launch that comes up paused must not
+    /// prompt — being asked for Accessibility on the way back in, for tracking
+    /// that is not going to happen, reads as the app ignoring the pause.
+    func requestPermissionIfNeeded() {
         if !AX.trusted { AX.promptForTrust() }
+    }
+
+    func start() {
+        if !isPaused { requestPermissionIfNeeded() }
         let t = Timer.scheduledTimer(withTimeInterval: Self.sampleInterval, repeats: true) { [weak self] _ in
             self?.tick()
         }
