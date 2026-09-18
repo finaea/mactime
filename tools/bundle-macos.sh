@@ -2,11 +2,14 @@
 # Builds MacTime and assembles publish/MacTime.app. Runs on the mac.
 #   tools/bundle-macos.sh [debug|release]   (default release)
 #
-# SwiftPM + CLT only — no Xcode on this machine, so the .app bundle is assembled
-# by hand, same approach as MonitorDim's bundle-macos.sh. Ad-hoc signed: TCC
-# permission grants (Screen Recording / Accessibility / Automation) are keyed to
-# the signature, so expect to re-grant after rebuilds until there's a real
-# Developer ID.
+# Needs Xcode, not just the Command Line Tools: the `swift build` below fails
+# without the SwiftUIMacros plugin, which CLT does not ship, so every @State in
+# UI/ fails to expand. The .app bundle itself is still assembled by hand rather
+# than by xcodebuild, same approach as MonitorDim's bundle-macos.sh.
+#
+# Ad-hoc signed: TCC permission grants (Screen Recording / Accessibility /
+# Automation) are keyed to the signature, so expect to re-grant after rebuilds
+# until there's a real Developer ID.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
