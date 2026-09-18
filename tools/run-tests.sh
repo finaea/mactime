@@ -1,6 +1,7 @@
 #!/bin/bash
 # Compiles and runs the checks in Tests/ — the pure date math, the day-key and
-# retention rules, and the store's erasure paths against a throwaway database.
+# retention rules, the capture privacy rules, and the store's erasure paths
+# against a throwaway database.
 #   tools/run-tests.sh
 #
 # Not a SwiftPM test target on purpose: `swift test` builds the app target too,
@@ -23,6 +24,7 @@ mkdir -p .build
 swiftc -swift-version 5 -target arm64-apple-macos15.0 \
     Sources/MacTime/Support/Format.swift \
     Sources/MacTime/Support/DayKey.swift \
+    Sources/MacTime/Support/URLPolicy.swift \
     Sources/MacTime/Support/TimeMath.swift \
     Sources/MacTime/Support/ImageCache.swift \
     Sources/MacTime/Store/Database.swift \

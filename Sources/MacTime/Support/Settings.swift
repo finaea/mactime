@@ -8,6 +8,7 @@ enum Settings {
         d.register(defaults: [
             Key.trackingEnabled: true,
             Key.browserTrackingEnabled: true,
+            Key.captureFullURLs: false,
             Key.idleThresholdSeconds: 300.0,
             Key.screenshotsEnabled: true,
             Key.screenshotIntervalSeconds: 15.0,
@@ -31,6 +32,10 @@ enum Settings {
         static let hoverPreviewOffsetY = "hoverPreviewOffsetY"
         static let trackingEnabled = "trackingEnabled"
         static let browserTrackingEnabled = "browserTrackingEnabled"
+        /// false — keep only a URL's origin (`https://mail.google.com`).
+        /// true  — keep the whole thing, query string included. Opt-in, and off
+        /// by default, because that query string is where the tokens live.
+        static let captureFullURLs = "captureFullURLs"
         static let idleThresholdSeconds = "idleThresholdSeconds"
         static let screenshotsEnabled = "screenshotsEnabled"
         static let screenshotIntervalSeconds = "screenshotIntervalSeconds"
@@ -40,6 +45,7 @@ enum Settings {
 
     static var trackingEnabled: Bool { d.bool(forKey: Key.trackingEnabled) }
     static var browserTrackingEnabled: Bool { d.bool(forKey: Key.browserTrackingEnabled) }
+    static var captureFullURLs: Bool { d.bool(forKey: Key.captureFullURLs) }
     static var idleThresholdSeconds: Double { d.double(forKey: Key.idleThresholdSeconds) }
     static var screenshotsEnabled: Bool { d.bool(forKey: Key.screenshotsEnabled) }
     static var screenshotIntervalSeconds: Double { d.double(forKey: Key.screenshotIntervalSeconds) }

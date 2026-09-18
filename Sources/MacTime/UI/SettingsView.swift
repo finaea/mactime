@@ -6,6 +6,7 @@ struct SettingsView: View {
 
     @AppStorage(Settings.Key.trackingEnabled) private var trackingEnabled = true
     @AppStorage(Settings.Key.browserTrackingEnabled) private var browserTrackingEnabled = true
+    @AppStorage(Settings.Key.captureFullURLs) private var captureFullURLs = false
     @AppStorage(Settings.Key.idleThresholdSeconds) private var idleThresholdSeconds = 300.0
     @AppStorage(Settings.Key.screenshotsEnabled) private var screenshotsEnabled = true
     @AppStorage(Settings.Key.screenshotIntervalSeconds) private var screenshotIntervalSeconds = 15.0
@@ -33,6 +34,14 @@ struct SettingsView: View {
             Section("Activity tracking") {
                 Toggle("Track active application and window", isOn: $trackingEnabled)
                 Toggle("Track browser tab URLs (Safari, Chrome, Firefox)", isOn: $browserTrackingEnabled)
+                Picker("Record", selection: $captureFullURLs) {
+                    Text("The site only (mail.google.com)").tag(false)
+                    Text("The full URL, query string included").tag(true)
+                }
+                .disabled(!browserTrackingEnabled)
+                Text("Query strings routinely carry session tokens, password-reset and sign-in links, and whatever you typed into a search box. \"Site only\" drops everything after the host at the moment of capture, so the rest is never written down in the first place.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Picker("Away after idle", selection: $idleThresholdSeconds) {
                     Text("1 minute").tag(60.0)
                     Text("3 minutes").tag(180.0)

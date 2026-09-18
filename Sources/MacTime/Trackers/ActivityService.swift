@@ -178,6 +178,7 @@ final class ActivityService {
         }
         let bundleId = app.bundleIdentifier ?? "pid.\(app.processIdentifier)"
         let name = app.localizedName ?? bundleId
+
         let title = AX.trusted ? AX.focusedWindowTitle(pid: app.processIdentifier) : nil
 
         var url: String?
@@ -192,7 +193,12 @@ final class ActivityService {
             if fresh, let cur = current, cur.sample.bundleId == bundleId, cur.sample.title == title {
                 url = cur.sample.url
             } else {
-                url = BrowserService.activeURL(bundleId: bundleId, pid: app.processIdentifier)
+                // Trimmed to its origin as it arrives, not on the way into the
+                // database. A query string that never gets past this line never
+                // reaches the `url` column — which is sealed at rest, but being
+                // able to seal something is not a reason to have written it down.
+                let raw = BrowserService.activeURL(bundleId: bundleId, pid: app.processIdentifier)
+                url = Settings.captureFullURLs ? raw : raw.flatMap(URLPolicy.origin(of:))
                 lastURLAt = now
             }
         }
