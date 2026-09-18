@@ -1,5 +1,6 @@
 import SwiftUI
 import ServiceManagement
+import UniformTypeIdentifiers
 
 struct SettingsView: View {
     let store: Store
@@ -19,6 +20,12 @@ struct SettingsView: View {
     @State private var startAtLogin = SMAppService.mainApp.status == .enabled
     @State private var loginItemError: String?
     @State private var diskUsage: String = "…"
+
+    /// Mirrors the defaults array, which `@AppStorage` can't bind. Written
+    /// straight back through `Settings` on every edit, so the trackers pick a
+    /// change up on their next tick without anything having to tell them.
+    @State private var excludedBundleIDs = Array(Settings.excludedBundleIDs)
+    @AppStorage(Settings.Key.excludedAppsReviewed) private var excludedAppsReviewed = false
 
     @State private var eraseScope: EraseScope = .day
     @State private var eraseFrom = Calendar.current.startOfDay(for: Date())
@@ -78,6 +85,8 @@ struct SettingsView: View {
                     Text("High").tag(0.8)
                 }
             }
+
+            excludedAppsSection
 
             Section("Timeline hover preview") {
                 offsetRow("Offset X", value: $hoverPreviewOffsetX)
@@ -139,6 +148,122 @@ struct SettingsView: View {
         } message: {
             Text(confirmMessage)
         }
+    }
+
+    // ----------------------------------------------------------- excluded apps
+
+    private var excludedAppsSection: some View {
+        Section("Excluded apps") {
+            Text("These apps' windows are cut out of screenshots — whatever sits behind one is still captured — and their window titles and browser URLs are never recorded. The app itself still counts towards your totals.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            ForEach(ExcludedApps.named(excludedBundleIDs)) { app in
+                HStack {
+                    if let icon = ExcludedApps.icon(for: app.bundleID) {
+                        Image(nsImage: icon)
+                            .resizable()
+                            .frame(width: 16, height: 16)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(app.name)
+                        Text(app.bundleID).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Remove") { removeExclusion(app.bundleID) }
+                        .controlSize(.small)
+                }
+            }
+
+            HStack {
+                Menu("Add app…") {
+                    ForEach(addableApps) { app in
+                        Button(app.name) { addExclusion(app.bundleID) }
+                    }
+                    if !addableApps.isEmpty { Divider() }
+                    Button("Choose from Applications…") { chooseAppToExclude() }
+                }
+                .fixedSize()
+                Spacer()
+                if excludedBundleIDs.isEmpty {
+                    Text("Nothing excluded.").font(.caption).foregroundStyle(.secondary)
+                }
+            }
+
+            suggestedExclusions
+            exclusionLimits
+        }
+    }
+
+    /// Running apps that aren't excluded yet. Running rather than installed
+    /// because enumerating every app on the disk to fill a menu is a lot of work
+    /// for a list the user is about to pick one item from — "Choose from
+    /// Applications…" covers anything that isn't open at the moment.
+    private var addableApps: [ExcludedApps.App] {
+        let already = Set(excludedBundleIDs)
+        return ExcludedApps.running().filter { !already.contains($0.bundleID) }
+    }
+
+    @ViewBuilder
+    private var suggestedExclusions: some View {
+        let suggestions = excludedAppsReviewed
+            ? []
+            : ExcludedApps.suggestions(alreadyExcluded: Set(excludedBundleIDs))
+        if !suggestions.isEmpty {
+            Divider()
+            VStack(alignment: .leading, spacing: 6) {
+                Text("You have \(suggestions.map(\.name).formatted(.list(type: .and))) installed. Exclude them?")
+                    .font(.caption)
+                HStack {
+                    Button("Exclude these") {
+                        for app in suggestions { addExclusion(app.bundleID) }
+                        excludedAppsReviewed = true
+                    }
+                    Button("No thanks") { excludedAppsReviewed = true }
+                    Spacer()
+                }
+                .controlSize(.small)
+            }
+        }
+    }
+
+    /// Stated here rather than left to be discovered. Each one is a way the
+    /// feature can look like it is working while something still gets through,
+    /// and a user who reads "excluded" as "never on my disk" is owed the
+    /// difference in the same place they turned it on.
+    private var exclusionLimits: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("What excluding an app does not do:")
+            Text("• It doesn't remove anything already recorded — use Delete data below for that.")
+            Text("• It can't stop the app's contents appearing in some other window: a notification banner, a screen-share preview, Mission Control.")
+            Text("• A window opening in the moment between MacTime listing what's on screen and taking the shot can still land in that one frame.")
+        }
+        .font(.caption)
+        .foregroundStyle(.secondary)
+    }
+
+    private func addExclusion(_ bundleID: String) {
+        guard !excludedBundleIDs.contains(bundleID) else { return }
+        excludedBundleIDs.append(bundleID)
+        Settings.setExcludedBundleIDs(excludedBundleIDs)
+    }
+
+    private func removeExclusion(_ bundleID: String) {
+        excludedBundleIDs.removeAll { $0 == bundleID }
+        Settings.setExcludedBundleIDs(excludedBundleIDs)
+    }
+
+    private func chooseAppToExclude() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.application]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.directoryURL = URL(fileURLWithPath: "/Applications")
+        panel.prompt = "Exclude"
+        panel.message = "Choose an app to leave out of screenshots and activity detail."
+        guard panel.runModal() == .OK, let url = panel.url,
+              let app = ExcludedApps.app(at: url) else { return }
+        addExclusion(app.bundleID)
     }
 
     // ------------------------------------------------------------- delete data

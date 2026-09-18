@@ -9,6 +9,8 @@ enum Settings {
             Key.trackingEnabled: true,
             Key.browserTrackingEnabled: true,
             Key.captureFullURLs: false,
+            Key.excludedBundleIDs: [String](),
+            Key.excludedAppsReviewed: false,
             Key.idleThresholdSeconds: 300.0,
             Key.screenshotsEnabled: true,
             Key.screenshotIntervalSeconds: 15.0,
@@ -36,6 +38,12 @@ enum Settings {
         /// true  — keep the whole thing, query string included. Opt-in, and off
         /// by default, because that query string is where the tokens live.
         static let captureFullURLs = "captureFullURLs"
+        /// Apps whose windows are cut out of screenshots, and whose window
+        /// titles and URLs are never recorded at all.
+        static let excludedBundleIDs = "excludedBundleIDs"
+        /// Whether the suggested exclusions have been answered. Accepting them
+        /// and declining them are both answers, and both stop the asking.
+        static let excludedAppsReviewed = "excludedAppsReviewed"
         static let idleThresholdSeconds = "idleThresholdSeconds"
         static let screenshotsEnabled = "screenshotsEnabled"
         static let screenshotIntervalSeconds = "screenshotIntervalSeconds"
@@ -46,6 +54,14 @@ enum Settings {
     static var trackingEnabled: Bool { d.bool(forKey: Key.trackingEnabled) }
     static var browserTrackingEnabled: Bool { d.bool(forKey: Key.browserTrackingEnabled) }
     static var captureFullURLs: Bool { d.bool(forKey: Key.captureFullURLs) }
+
+    /// A set, because every sample and every capture round asks it a membership
+    /// question. It lives in defaults as an array — `@AppStorage` cannot bind
+    /// one of those, so the list is edited through `setExcludedBundleIDs`.
+    static var excludedBundleIDs: Set<String> { Set(d.stringArray(forKey: Key.excludedBundleIDs) ?? []) }
+    static func setExcludedBundleIDs(_ ids: [String]) { d.set(ids, forKey: Key.excludedBundleIDs) }
+
+    static var excludedAppsReviewed: Bool { d.bool(forKey: Key.excludedAppsReviewed) }
     static var idleThresholdSeconds: Double { d.double(forKey: Key.idleThresholdSeconds) }
     static var screenshotsEnabled: Bool { d.bool(forKey: Key.screenshotsEnabled) }
     static var screenshotIntervalSeconds: Double { d.double(forKey: Key.screenshotIntervalSeconds) }

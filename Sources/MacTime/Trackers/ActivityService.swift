@@ -179,10 +179,18 @@ final class ActivityService {
         let bundleId = app.bundleIdentifier ?? "pid.\(app.processIdentifier)"
         let name = app.localizedName ?? bundleId
 
-        let title = AX.trusted ? AX.focusedWindowTitle(pid: app.processIdentifier) : nil
-
-        var url: String?
-        if Settings.browserTrackingEnabled, BrowserService.isBrowser(bundleId) {
+        // The name above is kept whatever happens — an excluded app still has to
+        // add up in the day's totals. Everything that says what was on screen
+        // goes through the policy instead, and for an excluded app the block
+        // below never runs at all: its title is not read, its browser is not
+        // asked, and there is nothing to decide against storing.
+        let detail = CapturePolicy.detail(for: bundleId,
+                                          excludedBundleIDs: Settings.excludedBundleIDs,
+                                          fullURLs: Settings.captureFullURLs) {
+            let title = AX.trusted ? AX.focusedWindowTitle(pid: app.processIdentifier) : nil
+            guard Settings.browserTrackingEnabled, BrowserService.isBrowser(bundleId) else {
+                return (title, nil)
+            }
             // Same app + same window title as the open span → probably the same
             // tab; reuse its URL instead of an Apple Events round-trip every 3s.
             // Only "probably", though: a title is not a URL identifier, and
@@ -191,17 +199,11 @@ final class ActivityService {
             // every later span stays pinned to the first URL of the session.
             let fresh = lastURLAt.map { now.timeIntervalSince($0) < Self.urlRefreshInterval } ?? false
             if fresh, let cur = current, cur.sample.bundleId == bundleId, cur.sample.title == title {
-                url = cur.sample.url
-            } else {
-                // Trimmed to its origin as it arrives, not on the way into the
-                // database. A query string that never gets past this line never
-                // reaches the `url` column — which is sealed at rest, but being
-                // able to seal something is not a reason to have written it down.
-                let raw = BrowserService.activeURL(bundleId: bundleId, pid: app.processIdentifier)
-                url = Settings.captureFullURLs ? raw : raw.flatMap(URLPolicy.origin(of:))
-                lastURLAt = now
+                return (title, cur.sample.url)
             }
+            lastURLAt = now
+            return (title, BrowserService.activeURL(bundleId: bundleId, pid: app.processIdentifier))
         }
-        return Sample(bundleId: bundleId, appName: name, title: title, url: url, kind: .active)
+        return Sample(bundleId: bundleId, appName: name, title: detail.title, url: detail.url, kind: .active)
     }
 }

@@ -125,9 +125,23 @@ final class ScreenshotService {
             try FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
             let activeID = Self.activeDisplayID()
 
+            // Cut out, not blacked out: ScreenCaptureKit composites the display
+            // without these apps' windows, so whatever sits behind one shows
+            // through and the rest of the screen is captured as usual. Skipping
+            // the whole round instead would lose the video playing next to the
+            // password manager, which is most of the point of having the shot.
+            //
+            // Filtered by application rather than by an enumerated window list,
+            // so a window an excluded app opens after this line is still cut.
+            let excluded = Settings.excludedBundleIDs
+            let excludedApps = excluded.isEmpty ? []
+                : content.applications.filter { excluded.contains($0.bundleIdentifier) }
+
             for display in content.displays {
                 guard shouldKeepCapturing else { return }
-                let filter = SCContentFilter(display: display, excludingWindows: [])
+                let filter = SCContentFilter(display: display,
+                                             excludingApplications: excludedApps,
+                                             exceptingWindows: [])
                 let config = SCStreamConfiguration()
                 let scale = CGFloat(filter.pointPixelScale)
                 config.width = Int(filter.contentRect.width * scale)
