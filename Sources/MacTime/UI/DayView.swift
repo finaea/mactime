@@ -600,7 +600,14 @@ final class DayModel: ObservableObject {
     }
 
     /// Nearest screenshot within 15 minutes of a hovered timeline moment.
+    /// The window is symmetric on purpose: hovering an Away or Sleep gap has no
+    /// capture of its own, and the frame that ends the gap is often the closer
+    /// of the two that bracket it. It stops at the present, though — the axis
+    /// always spans the full 24 hours, so on today's view the stretch right of
+    /// "now" is drawn and hoverable, and reaching back into it would answer a
+    /// moment that hasn't happened yet with a frame taken minutes before it.
     func nearestShot(to time: Date) -> ScreenshotRecord? {
+        guard time <= Date() else { return nil }
         guard let best = shots.min(by: {
             abs($0.takenAt.timeIntervalSince(time)) < abs($1.takenAt.timeIntervalSince(time))
         }) else { return nil }
