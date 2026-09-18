@@ -135,6 +135,7 @@ struct SettingsView: View {
                 Button("Show in Finder") {
                     NSWorkspace.shared.activateFileViewerSelecting([store.dataDir])
                 }
+                encryptionStatus
             }
 
             deleteSection
@@ -264,6 +265,35 @@ struct SettingsView: View {
         guard panel.runModal() == .OK, let url = panel.url,
               let app = ExcludedApps.app(at: url) else { return }
         addExclusion(app.bundleID)
+    }
+
+    // ------------------------------------------------------------- encryption
+
+    /// Said in Settings and not only as a chip in the day view, because this is
+    /// where someone goes to find out what is on their disk. It also quietly
+    /// answers the question the Finder raises: the captures still end in `.jpg`
+    /// and no longer open, because they aren't images any more.
+    @ViewBuilder
+    private var encryptionStatus: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Label("Screenshots, window titles and web addresses are encrypted on disk.",
+                  systemImage: "lock.fill")
+            Text("The key is kept in your login keychain rather than beside the data, so anything that reads this folder gets ciphertext. The screenshot files keep their .jpg names but are no longer images, which is why Finder can't preview them.")
+                .foregroundStyle(.secondary)
+        }
+        .font(.caption)
+
+        if let why = Crypto.shared.unavailableReason {
+            // Same words and the same orange as the day view's chip: a user who
+            // has seen one and then comes looking here should find the problem
+            // they already met, not a second one worded differently.
+            VStack(alignment: .leading, spacing: 4) {
+                Label("Data key unavailable", systemImage: "exclamationmark.triangle.fill")
+                    .font(.callout)
+                    .foregroundStyle(.orange)
+                Text(why).font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     // ------------------------------------------------------------- delete data
