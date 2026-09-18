@@ -94,6 +94,13 @@ enum Rewrap {
                 // Gone since the walk: retention or an erase doing its job
                 // while this runs. Not a failure, and not ours to report.
                 guard let raw = try? Data(contentsOf: url) else { continue }
+                // Everything not already sealed gets sealed — deliberately not
+                // narrowed to "files that look like a JPEG". A whitelist would
+                // fail the wrong way: get it wrong, or change the capture
+                // format later, and this silently walks past files that need
+                // encrypting and leaves them in the clear, which is the exact
+                // failure the whole change exists to prevent. Sealing something
+                // twice is recoverable; not sealing it is the bug.
                 guard !Crypto.isSealed(raw) else { continue }
                 guard let sealed = try? crypto.seal(raw) else {
                     summary.failed += 1

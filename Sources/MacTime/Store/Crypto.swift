@@ -39,15 +39,24 @@ final class Crypto: Sendable {
     /// Nonce + tag. With the magic, 32 bytes per sealed value.
     private static let boxOverhead = 12 + 16
 
+    /// The two rejections are not a judgement about how bad the damage is, and
+    /// no caller tells them apart — every one of them collapses both to "this
+    /// can't be read". Which one comes back is decided by *where* the damage
+    /// is, because `open` checks the magic before it hands anything to GCM:
+    /// corrupt the magic and it is turned away as `notSealed`; corrupt the
+    /// nonce, the ciphertext or the tag and GCM rejects it as `corrupt`. What
+    /// holds either way — and what actually matters — is that nothing tampered
+    /// with ever opens to something.
     enum Failure: Error {
         /// No usable key — see `unavailableReason`. Never a reason to fall back
         /// to writing plaintext.
         case noKey
-        /// Handed something that isn't one of ours.
+        /// Doesn't carry the magic, so it is either plaintext or too damaged to
+        /// recognise. `openIfSealed` treats the first case as the ordinary one.
         case notSealed
-        /// GCM said no: a flipped byte, a truncated file, or the wrong key.
-        /// Authenticated encryption makes these one answer, which is the point
-        /// — a tampered capture fails rather than decoding to something.
+        /// GCM said no: a flipped byte in the box, a truncated file, or the
+        /// wrong key. Authenticated encryption makes those one answer, which is
+        /// the point — there is no partial success to mistake for a result.
         case corrupt
     }
 
