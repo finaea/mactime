@@ -38,7 +38,8 @@ enum URLPolicy {
     ///
     /// Nothing is ever produced by trimming the input. Every result is built
     /// from a parsed scheme, host and port, so there is no arrangement of path
-    /// or query — however badly formed — that can survive into one.
+    /// or query — however badly formed — that can survive into one, and every
+    /// result that names a host is a URL that parses back.
     static func origin(of raw: String) -> String? {
         let s = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !s.isEmpty else { return nil }
@@ -47,7 +48,8 @@ enum URLPolicy {
            !scheme.isEmpty {
             // `.host` is the host alone — userinfo lands in `.user`/`.password`,
             // which are simply never read here.
-            guard let host = parts.host?.lowercased(), !host.isEmpty else { return scheme + ":" }
+            guard let raw = parts.host?.lowercased(), !raw.isEmpty else { return scheme + ":" }
+            guard let host = validHost(raw) else { return nil }
             return assemble(scheme: scheme, host: host, port: parts.port)
         }
         return textualOrigin(of: s)
@@ -90,9 +92,34 @@ enum URLPolicy {
             port = n
             host = String(host[..<colon])
         }
-        guard !host.isEmpty else { return nil }
-        return assemble(scheme: scheme, host: host.lowercased(), port: port)
+        guard let host = validHost(host.lowercased()) else { return nil }
+        return assemble(scheme: scheme, host: host, port: port)
     }
+
+    /// The bare host, or nil if it isn't one.
+    ///
+    /// `URLComponents` is happy to hand back a host with a space in it, and a
+    /// host with a space in it is not a host. Rejecting it keeps the promise
+    /// that everything returned from here is a valid URL, and costs nothing: no
+    /// browser produces one.
+    ///
+    /// Brackets come off an IPv6 literal first, because Foundation's answer for
+    /// one varies and `assemble` puts them back. Colons survive for the same
+    /// reason — a bare IPv6 literal is mostly colons.
+    private static func validHost(_ raw: String) -> String? {
+        var host = raw
+        if host.hasPrefix("["), host.hasSuffix("]") {
+            host = String(host.dropFirst().dropLast())
+        }
+        guard !host.isEmpty, host.rangeOfCharacter(from: forbiddenInHost) == nil else { return nil }
+        return host
+    }
+
+    /// Whitespace and controls, plus the delimiters that would end the authority
+    /// if the result were ever parsed again.
+    private static let forbiddenInHost = CharacterSet(charactersIn: "/?#@[]")
+        .union(.whitespacesAndNewlines)
+        .union(.controlCharacters)
 
     private static func assemble(scheme: String, host: String, port: Int?) -> String {
         // `URLComponents` hands back an IPv6 literal without its brackets, and
