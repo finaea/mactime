@@ -179,6 +179,31 @@ final class Store {
     }
 
     // ------------------------------------------------------------- spans
+    //
+    // `window_title` and `url` are sealed; `start`, `end`, `kind` and
+    // `app_bundle_id` are not, which keeps `appTotals` and `dayStats` one SQL
+    // statement each. The trade is worth saying out loud rather than burying:
+    // someone reading the database file still learns which apps were used when.
+    // They learn nothing about what the windows were called or which pages were
+    // open, and those are the fields that read like `Q3 Layoff List.xlsx` or
+    // carry a password-reset token in a query string.
+    //
+    // The column holds both formats for as long as `Rewrap` takes to work
+    // through the rows written before this shipped. SQLite's type tag is what
+    // separates them — see `unsealed`.
+
+    /// Text for a column, sealed. Empty is stored as NULL rather than as 32
+    /// bytes of ciphertext wrapping nothing; every reader already treats the
+    /// two the same.
+    ///
+    /// Without a key this returns nil, so the span keeps its app, its times and
+    /// its kind and loses only its title — the day still adds up, and the one
+    /// field this change exists to protect does not land in the clear because
+    /// the keychain happened to be unreachable.
+    private func sealedText(_ text: String?) -> Data? {
+        guard let text, !text.isEmpty else { return nil }
+        return try? crypto.seal(Data(text.utf8))
+    }
 
     func insertSpan(start: Date, end: Date, bundleId: String, appName: String,
                     title: String?, url: String?, kind: SpanKind) -> Int64 {
@@ -186,9 +211,32 @@ final class Store {
         INSERT INTO activity_spans (start, end, app_bundle_id, app_name, window_title, url, kind)
         VALUES (?,?,?,?,?,?,?)
         """, bind: [start.timeIntervalSince1970, end.timeIntervalSince1970,
-                    bundleId, appName, title, url, kind.rawValue])
+                    bundleId, appName, sealedText(title), sealedText(url), kind.rawValue])
         return db.lastInsertId
     }
+
+    /// One title or URL column, whichever format the row happens to be in.
+    ///
+    /// A blob that won't open comes back as `Self.locked`, never as nil. nil
+    /// reads as "nothing was recorded here", and telling someone their history
+    /// is empty when it is merely unreadable is the one thing this must not do.
+    private func unsealed(_ s: OpaquePointer, _ col: Int32) -> String? {
+        switch Database.value(s, col) {
+        case .null:
+            return nil
+        case .blob(let blob):
+            guard let plain = try? crypto.open(blob),
+                  let text = String(data: plain, encoding: .utf8) else { return Self.locked }
+            return text
+        case .text(let text):
+            // Written before encryption and not yet rewritten by `Rewrap`.
+            return text
+        }
+    }
+
+    /// Stands in for a title or URL that is on disk but can't be read — a
+    /// missing key, or a row that failed authentication.
+    static let locked = "(encrypted — key unavailable)"
 
     func updateSpanEnd(id: Int64, end: Date) {
         db.run("UPDATE activity_spans SET end = ? WHERE id = ?",
@@ -208,8 +256,8 @@ final class Store {
                 end: Date(timeIntervalSince1970: Database.double(s, 2)),
                 bundleId: Database.text(s, 3) ?? "",
                 appName: Database.text(s, 4) ?? "",
-                title: Database.text(s, 5),
-                url: Database.text(s, 6),
+                title: self.unsealed(s, 5),
+                url: self.unsealed(s, 6),
                 kind: SpanKind(rawValue: Database.text(s, 7) ?? "active") ?? .active))
         }
         return out
@@ -243,20 +291,88 @@ final class Store {
     }
 
     /// Per-title (and URL) active seconds for one app within [from, to).
+    ///
+    /// Grouped in Swift rather than in SQL, which is the one query encrypting
+    /// these columns costs. Every value is sealed under a fresh random nonce —
+    /// it has to be, or identical titles would be identifiable as identical
+    /// straight out of the file — so two visits to the same page hold different
+    /// bytes and `GROUP BY window_title, url` would file each one on its own
+    /// row. Decrypt first, then group.
+    ///
+    /// Affordable because of where it sits: one app, one range, so this walks
+    /// the spans of a single app rather than the table. A day of *every* app's
+    /// spans decrypts in about 1 ms. `appTotals` and `dayStats` never touch
+    /// these columns and stay pure SQL.
     func titleTotals(from: Date, to: Date, bundleId: String) -> [TitleTotal] {
-        var out: [TitleTotal] = []
+        var acc: [String: TitleTotal] = [:]
         db.run("""
-        SELECT COALESCE(window_title, ''), url,
-               SUM(MIN(end, ?2) - MAX(start, ?1)) AS secs
+        SELECT window_title, url, MIN(end, ?2) - MAX(start, ?1) AS secs
         FROM activity_spans
         WHERE end > ?1 AND start < ?2 AND kind = 'active' AND app_bundle_id = ?3
-        GROUP BY window_title, url ORDER BY secs DESC
         """, bind: [from.timeIntervalSince1970, to.timeIntervalSince1970, bundleId]) { s in
-            out.append(TitleTotal(title: Database.text(s, 0) ?? "",
-                                  url: Database.text(s, 1),
-                                  seconds: Database.double(s, 2)))
+            let title = self.unsealed(s, 0) ?? ""
+            let url = self.unsealed(s, 1)
+            let secs = Database.double(s, 2)
+            // Separator no title can contain, so a title ending where a URL
+            // begins can't collide with a different split of the same text.
+            let key = title + "\u{1}" + (url ?? "")
+            if let existing = acc[key] {
+                acc[key] = TitleTotal(title: title, url: url, seconds: existing.seconds + secs)
+            } else {
+                acc[key] = TitleTotal(title: title, url: url, seconds: secs)
+            }
         }
-        return out
+        // Ties broken by name: a dictionary has no order, and the table this
+        // feeds would otherwise reshuffle equal rows between reloads.
+        return acc.values.sorted {
+            $0.seconds == $1.seconds ? $0.id < $1.id : $0.seconds > $1.seconds
+        }
+    }
+
+    /// Seal one batch of the titles and URLs written before encryption, and say
+    /// how many rows it rewrote. Zero means there are none left — which is also
+    /// what it returns without a key, so the caller's loop ends rather than
+    /// spinning.
+    ///
+    /// `typeof()` is the whole of the resume story: a row still holding TEXT
+    /// hasn't been done, one holding a BLOB or NULL has. Nothing records how far
+    /// a previous run got, so an interrupted pass costs only its last batch.
+    ///
+    /// Batched because `Store` is main-thread-only and a store at the ninety-day
+    /// setting holds tens of thousands of these; the caller yields between
+    /// batches so the window stays live.
+    func sealPlaintextSpans(limit: Int = 500) -> Int {
+        guard crypto.isReady else { return 0 }
+        var rows: [(id: Int64, title: String?, url: String?)] = []
+        db.run("""
+        SELECT id, window_title, url FROM activity_spans
+        WHERE typeof(window_title) = 'text' OR typeof(url) = 'text' LIMIT ?
+        """, bind: [limit]) { s in
+            rows.append((Database.int64(s, 0), Database.text(s, 1), Database.text(s, 2)))
+        }
+        guard !rows.isEmpty else { return 0 }
+
+        // Sealed before the transaction opens, because this writes over the
+        // only copy: a row whose title can't be sealed has to keep the title it
+        // has rather than have it replaced with NULL. `sealedText` can only
+        // fail without a key, which is checked above — but the cost of being
+        // wrong here is silently deleting someone's history, so it is checked
+        // again rather than assumed.
+        var updates: [(id: Int64, title: Data?, url: Data?)] = []
+        for row in rows {
+            let title = sealedText(row.title), url = sealedText(row.url)
+            guard (row.title?.isEmpty != false || title != nil),
+                  (row.url?.isEmpty != false || url != nil) else { return 0 }
+            updates.append((row.id, title, url))
+        }
+
+        db.exec("BEGIN;")
+        for update in updates {
+            db.run("UPDATE activity_spans SET window_title = ?, url = ? WHERE id = ?",
+                   bind: [update.title, update.url, update.id])
+        }
+        db.exec("COMMIT;")
+        return updates.count
     }
 
     /// Start of the earliest span — the "all time" range's left edge.

@@ -52,6 +52,14 @@ final class Database {
             case let n as Int64: sqlite3_bind_int64(s, idx, n)
             case let n as Int: sqlite3_bind_int64(s, idx, Int64(n))
             case let t as String: sqlite3_bind_text(s, idx, t, -1, SQLITE_TRANSIENT)
+            // Sealed window titles and URLs. They go in as blobs rather than as
+            // text because SQLite's own type tag is then the format marker:
+            // rows written before encryption hold TEXT, sealed ones hold BLOB,
+            // and no title a user could have can be mistaken for either. Binding
+            // as text would also truncate at the first zero byte, which
+            // ciphertext is full of.
+            case let d as Data:
+                d.withUnsafeBytes { sqlite3_bind_blob(s, idx, $0.baseAddress, Int32(d.count), SQLITE_TRANSIENT) }
             default: sqlite3_bind_null(s, idx)
             }
         }
@@ -86,5 +94,26 @@ final class Database {
     }
     static func int64(_ s: OpaquePointer, _ col: Int32) -> Int64 {
         sqlite3_column_int64(s, col)
+    }
+    /// What a column actually holds, for the two that carry either a sealed
+    /// blob or the plaintext a row was written with before encryption. SQLite
+    /// is dynamically typed, so its own tag separates them — and reading it
+    /// here keeps `SQLITE_*` inside the one file that talks to sqlite3.
+    enum Value {
+        case null
+        case blob(Data)
+        case text(String)
+    }
+
+    static func value(_ s: OpaquePointer, _ col: Int32) -> Value {
+        switch sqlite3_column_type(s, col) {
+        case SQLITE_NULL:
+            return .null
+        case SQLITE_BLOB:
+            guard let bytes = sqlite3_column_blob(s, col) else { return .null }
+            return .blob(Data(bytes: bytes, count: Int(sqlite3_column_bytes(s, col))))
+        default:
+            return text(s, col).map(Value.text) ?? .null
+        }
     }
 }

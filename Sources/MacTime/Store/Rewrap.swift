@@ -42,9 +42,38 @@ enum Rewrap {
 
         Task.detached(priority: .utility) {
             let summary = await files(in: dir, using: crypto, writtenBefore: launchedAt)
-            guard summary.sealed + summary.failed > 0 else { return }
-            NSLog("MacTime: encrypted %d screenshot files written before encryption (%d failed)",
-                  summary.sealed, summary.failed)
+            if summary.sealed + summary.failed > 0 {
+                NSLog("MacTime: encrypted %d screenshot files written before encryption (%d failed)",
+                      summary.sealed, summary.failed)
+            }
+        }
+        // Separate task: the rows have to be done on the main thread, where
+        // `Store` lives, while the files must not be. Neither waits on the
+        // other — they touch nothing in common.
+        Task { @MainActor in
+            let sealed = await spans(in: store)
+            guard sealed > 0 else { return }
+            NSLog("MacTime: encrypted %d window titles and URLs written before encryption", sealed)
+        }
+    }
+
+    /// Seal every title and URL still stored as plaintext.
+    ///
+    /// On the main thread because `Store` is, so the yield between batches is
+    /// not a nicety: without it a store at the ninety-day setting would hold
+    /// the run loop for as long as the whole rewrite takes. Each batch is its
+    /// own transaction, so stopping between two of them leaves the database
+    /// consistent and the next launch picks up the rest.
+    @discardableResult
+    @MainActor
+    static func spans(in store: Store, batch: Int = 500,
+                      pauseNanoseconds: UInt64 = 20_000_000) async -> Int {
+        var total = 0
+        while true {
+            let sealed = store.sealPlaintextSpans(limit: batch)
+            guard sealed > 0 else { return total }
+            total += sealed
+            try? await Task.sleep(nanoseconds: pauseNanoseconds)
         }
     }
 
