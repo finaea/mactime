@@ -1256,7 +1256,7 @@ struct DockedViewer: View {
     @ViewBuilder
     private func actions(for shot: ScreenshotRecord) -> some View {
         Button("Open in Preview") {
-            guard let file = Self.decrypted(shot, into: Self.exportDirectory) else { return }
+            guard let file = Self.decrypted(shot, into: Store.exportDir) else { return }
             NSWorkspace.shared.open(file)
         }
         Button("Show in Finder") {
@@ -1282,20 +1282,17 @@ struct DockedViewer: View {
         }
     }
 
-    /// Where "Open in Preview" leaves its decrypted copy. It is plaintext, in
-    /// a directory macOS clears between boots — the one thing that makes it
-    /// acceptable is that the user just asked for this capture to be opened in
-    /// another app, same as Save As…, which writes plaintext wherever they
-    /// point it. Nothing else is written here, and mode 0600 keeps it out of
-    /// reach of other accounts on the machine.
-    private static let exportDirectory = URL(fileURLWithPath: NSTemporaryDirectory())
-        .appendingPathComponent("MacTime", isDirectory: true)
-
     private static func jpeg(of shot: ScreenshotRecord) -> Data? {
         guard let raw = try? Data(contentsOf: URL(fileURLWithPath: shot.path)) else { return nil }
         return try? Crypto.shared.openIfSealed(raw)
     }
 
+    /// A decrypted copy for another app to open. This is plaintext, which is
+    /// the thing the whole change is about — what makes it acceptable is that
+    /// the user just asked for this capture to be handed to Preview, exactly as
+    /// Save As… hands one wherever they point it. What bounds it is that
+    /// `Store.sweepExports` empties this directory at every launch; 0600 only
+    /// keeps out other accounts on the machine, which was never the threat.
     private static func decrypted(_ shot: ScreenshotRecord, into dir: URL) -> URL? {
         guard let jpeg = jpeg(of: shot) else { return nil }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)

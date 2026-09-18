@@ -67,12 +67,15 @@ final class Store {
     /// `~/Library/Application Support/MacTime` is not an option.
     ///
     /// `crypto` follows the same rule, and its default leans on it: a store
-    /// given a directory is a throwaway, so it gets a throwaway key rather than
-    /// reaching for the login keychain. A check run must never read the key the
-    /// real store is sealed with, and — worse — must never be the thing that
-    /// creates it. The consequence for the checks is that reopening the same
-    /// directory needs the same `Crypto` passed back in; a fresh one cannot
-    /// read what the last one wrote, which is the property being relied on.
+    /// given a directory but no `Crypto` is a throwaway, so it gets a throwaway
+    /// key rather than reaching for the login keychain. A check run must never
+    /// read the key the real store is sealed with, and — worse — must never be
+    /// the thing that creates it.
+    ///
+    /// That is only the *default*, though. `crypto` is a parameter, so a check
+    /// that needs a particular key with a particular directory passes one —
+    /// which is also how a check reopens a store: a fresh throwaway key cannot
+    /// read what the last one wrote, so the same `Crypto` has to come back in.
     init(directory: URL? = nil, crypto: Crypto? = nil) {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         dataDir = directory ?? appSupport.appendingPathComponent("MacTime", isDirectory: true)
@@ -93,8 +96,36 @@ final class Store {
         // them is background work that must not hold up launch, so it is
         // started and forgotten. Hung off `init` rather than off a service's
         // `start()` because this is the one place guaranteed to run once per
-        // launch whatever the tracking settings say.
-        if directory == nil { Rewrap.start(in: self) }
+        // launch whatever the tracking settings say — which is also why the
+        // export sweep lives here.
+        if directory == nil {
+            Task.detached(priority: .utility) { Store.sweepExports() }
+            Rewrap.start(in: self)
+        }
+    }
+
+    /// Where the viewer leaves decrypted copies of captures for Preview and
+    /// anything else outside MacTime. Plaintext by necessity — Preview cannot
+    /// read a sealed capture — and therefore swept at every launch.
+    static let exportDir = URL(fileURLWithPath: NSTemporaryDirectory())
+        .appendingPathComponent("MacTime", isDirectory: true)
+
+    /// Throw away everything the viewer decrypted for another app.
+    ///
+    /// "The system clears the temporary directory between boots" is not a bound
+    /// worth leaning on. A Mac left running for a fortnight would accumulate a
+    /// plaintext copy of every capture its user thought worth opening — which
+    /// is to say the interesting ones — in a directory that is not
+    /// TCC-protected and that any process running as them reads freely. That is
+    /// the finding this whole change exists to close, reopened for the worst
+    /// possible subset of it. The 0600 mode those copies carry keeps out other
+    /// *accounts*, and other accounts were never the attacker here.
+    ///
+    /// At launch rather than at quit, because an app that is force-quit or
+    /// crashes never runs a terminate handler and this has to hold then too.
+    /// The exposure that buys is one session instead of one boot.
+    static func sweepExports(_ dir: URL = exportDir) {
+        try? FileManager.default.removeItem(at: dir)
     }
 
     func close() { db.close() }
