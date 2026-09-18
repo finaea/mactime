@@ -243,6 +243,17 @@ final class ScreenshotService {
                       crypto.unavailableReason ?? "encryption failed")
                 return
             }
+            // The hold is checked once more here, because *here* is the commit
+            // point — not the guard back in `captureRound`, which ran before a
+            // 5K JPEG encode that takes tens of milliseconds. An erase starting
+            // inside that gap would otherwise find this capture's bytes landing
+            // in a folder it had already swept, which is the one thing
+            // `CaptureSuspension` exists to prevent and the thing both its
+            // comment and `Erase.data`'s claim it already does. Dropping the
+            // round is the right answer and not a loss worth reporting: the
+            // user asked for that range to go, and a capture that outlives
+            // "delete everything" is worse than a missing fifteen seconds.
+            guard !CaptureSuspension.isSuspended else { return }
             do {
                 // Atomically, so a crash or a kill mid-write can't leave a
                 // truncated file behind. It mattered less when these were

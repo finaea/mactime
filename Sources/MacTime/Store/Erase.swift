@@ -54,10 +54,44 @@ enum Erase {
     ///
     /// Only the database work is main-thread; unlinking a day is hundreds of
     /// files and an erase-everything is tens of thousands.
+    ///
+    /// One erase at a time — see `inFlight`.
     @MainActor
     @discardableResult
     static func data(from: Date?, to: Date?, in store: Store,
                      contents: Contents) async -> Summary {
+        let previous = inFlight
+        let mine = Task { @MainActor in
+            if let previous { _ = await previous.value }
+            return await perform(from: from, to: to, in: store, contents: contents)
+        }
+        inFlight = mine
+        return await mine.value
+    }
+
+    /// The erase most recently queued, which the next one waits on.
+    ///
+    /// Two erases can genuinely overlap: the midnight retention sweep and a
+    /// "Delete data…" the user starts while it runs. `ScreenshotService.pruning`
+    /// only ever guarded prune against prune. Both being `@MainActor` is no
+    /// help either — this function awaits in three places, and the database work
+    /// on the far side of each await is what they interleave.
+    ///
+    /// Nothing is destroyed by the overlap: `remove` treats an already-gone file
+    /// as removed and `deleteScreenshots` counts only the rows it actually
+    /// deleted. What comes out wrong is the number the user is shown. Both
+    /// erases select the same rows, the first deletes them, and the second
+    /// reports a total short of what it took — so the sheet says "Deleted 0
+    /// screenshots" over a store that has just been emptied, which reads as a
+    /// failure of the thing the user most needs to believe worked.
+    ///
+    /// Queued rather than refused: a caller that asked for an erase gets one,
+    /// and gets an honest count of what its own turn removed.
+    @MainActor private static var inFlight: Task<Summary, Never>?
+
+    @MainActor
+    private static func perform(from: Date?, to: Date?, in store: Store,
+                                contents: Contents) async -> Summary {
         // Hold capture off for the whole erase. `defer` and not a pair of calls
         // at top and bottom: there are early returns below, and a hold that
         // leaks is a tracker that has quietly stopped recording with nothing
@@ -81,9 +115,9 @@ enum Erase {
         // whatever landed in between. The suspension above stops new rounds and
         // turns back any round that hasn't reached its commit point, which
         // leaves one case: a capture already past that point, with its bytes on
-        // the encode queue and its row not yet inserted. So the loop stays. It
-        // is bounded rather than run to a fixed point because a capture
-        // arriving after the last pass belongs to the next erase, not to an
+        // the encode queue and its row not yet inserted. So the passes stay.
+        // They are bounded rather than run to a fixed point because a capture
+        // arriving after the last one belongs to the next erase, not to an
         // infinite loop.
         //
         // Each capture is attempted at most once. The later passes are for
@@ -135,6 +169,24 @@ enum Erase {
                 try? FileManager.default.removeItem(at: keyCheck)
             }
         }.value
+        // What is left open here, since the passes above deliberately do not
+        // chase it: a capture whose row is inserted after the last of them has
+        // run keeps its row, while `sweepFolders` has already taken the folder
+        // its file sat in. The result is a row naming nothing — a blank tile in
+        // the viewer, and nothing worse; the database is consistent and the
+        // next erase over that range clears it.
+        //
+        // Reproduced at every delay past about two milliseconds, and an extra
+        // pass after this sweep was tried and removed: it moved the window by
+        // roughly a millisecond and bought a query on every erase. Nothing
+        // inside this function can close it, because the row can land after the
+        // function has returned. What narrows it is a check at the far end —
+        // `ScreenshotService.save` consults the suspension again on the encode
+        // queue, immediately before the write, so a round whose bytes are still
+        // being encoded when an erase starts is dropped rather than landing
+        // behind it. Closing it outright would mean the capture path holding
+        // the write and the row insert under one hold that `Erase` can take,
+        // which is a larger change than a blank tile is worth.
 
         let summary = Summary(screenshots: screenshots, spans: spans, failedFiles: failed)
         // Nothing deleted is the ordinary case for the daily retention sweep,
