@@ -24,6 +24,8 @@ enum URLPolicy {
     ///  - **Default ports go, others stay.** `:3000` says which local dev
     ///    server; it is not a secret. `localhost` and IP literals are hosts like
     ///    any other, and an IPv6 literal keeps its brackets.
+    ///  - **A number outside 1–65535 is not a port**, and takes the whole URL
+    ///    with it rather than being dropped on its own — see `assemble`.
     ///  - **Case is normalised.** Scheme and host are case-insensitive, so
     ///    lowercasing them stops `Mail.Google.com` splitting a span off its own
     ///    origin.
@@ -87,7 +89,16 @@ enum URLPolicy {
                 return nil
             }
             host = String(host[...close])
-        } else if let colon = host.lastIndex(of: ":") {
+        } else if let colon = host.lastIndex(of: ":"), !host[..<colon].contains(":") {
+            // Only when what precedes it holds no colon of its own. An
+            // unbracketed authority with several is a bare IPv6 literal, not a
+            // host and a port — `http://::1/x` was being split at the last one
+            // into host ":" and port 1, and `assemble` then re-bracketed the
+            // wreckage as `http://[:]:1`. Left whole it comes out `http://[::1]`,
+            // which is what `validHost` keeping colons and `assemble` putting
+            // brackets back are both for. `::1:8080` stays entirely host, since
+            // nothing can say whether that tail is a port or a hextet; either
+            // reading names a machine and neither carries a path.
             guard let n = Int(host[host.index(after: colon)...]) else { return nil }
             port = n
             host = String(host[..<colon])
@@ -121,7 +132,23 @@ enum URLPolicy {
         .union(.whitespacesAndNewlines)
         .union(.controlCharacters)
 
-    private static func assemble(scheme: String, host: String, port: Int?) -> String {
+    /// Scheme, host and a port worth keeping — or nil when those parts don't
+    /// make a URL.
+    ///
+    /// The one place a port is checked, because it is the one place a port is
+    /// written, and all three paths into here arrive with one that nobody has
+    /// range-checked: `URLComponents` will hand back `:99999` quite happily.
+    private static func assemble(scheme: String, host: String, port: Int?) -> String? {
+        // A number outside 1–65535 isn't a port, and the whole URL goes rather
+        // than the port alone. Two reasons. `https://example.com:-1/x` was
+        // becoming `https://example.com:-1`, which does not parse back as a URL
+        // — the promise made above about every result that names a host. And a
+        // port that isn't a number already dropped the entire URL a few lines
+        // up, so this keeps one rule for "the authority didn't come apart"
+        // rather than two. Keeping the host and quietly discarding the part
+        // that made no sense would be guessing at what the rest of it meant,
+        // which is what this file refuses to do everywhere else.
+        if let port, !(1...65535).contains(port) { return nil }
         // `URLComponents` hands back an IPv6 literal without its brackets, and
         // without them the result doesn't parse back as a URL.
         let h = host.contains(":") && !host.hasPrefix("[") ? "[\(host)]" : host
