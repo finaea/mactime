@@ -405,6 +405,16 @@ struct SettingsView: View {
         confirmMessage = "\(counts.screenshots) screenshot\(counts.screenshots == 1 ? "" : "s") and "
             + "\(counts.spans) activity entr\(counts.spans == 1 ? "y" : "ies"), including window "
             + "titles and URLs. This can't be undone."
+        if eraseScope == .all {
+            // The one thing "everything" doesn't take, said at the moment of
+            // confirming rather than left to be discovered in Keychain Access.
+            // What the erase does remove is the key-*check* file, which is the
+            // interlock that stops a launch minting a new key over data sealed
+            // with one it can't reach — see `Erase.data`. Removing it is how a
+            // user whose key went missing gets a working app back.
+            confirmMessage += " Your encryption key stays in your keychain; MacTime carries on "
+                + "with it for whatever you record next."
+        }
         confirmingErase = true
     }
 

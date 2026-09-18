@@ -90,6 +90,48 @@ Everything lives in `~/Library/Application Support/MacTime/`:
 SQLite database (`MacTime.db`: activity spans + screenshot index) and
 `Screenshots/yyyy-MM-dd/` image folders. Nothing leaves the machine.
 
+### Encryption at rest
+
+Screenshots, window titles and browser URLs are encrypted with AES-256-GCM
+before they reach the disk. `~/Library/Application Support/` is not covered by
+macOS privacy protection, while Screen Recording is — so anything running as you
+can read that folder with no prompt at all. Encrypted, all it gets is
+ciphertext. The capture files keep their `.jpg` names but are no longer images,
+which is why Finder can't preview them.
+
+Deliberately left in the clear: span start/end, the app's bundle ID, and whether
+a span was active, idle or sleep, so the statistics stay one SQL query each. The
+trade, stated plainly: someone reading the database still learns which apps you
+used when. They learn nothing about what was on the screen, what the windows
+were called, or which pages were open.
+
+**The key is in your login keychain and nowhere else.** It is stored
+`WhenUnlockedThisDeviceOnly`, which is macOS's way of keeping it out of iCloud
+Keychain and out of any backup that could restore it onto another machine. That
+is the intended posture, and it has one consequence worth meeting here rather
+than on the day:
+
+> **Copying `~/Library/Application Support/MacTime/` to a new Mac leaves you an
+> unreadable archive, by design.** The data travels; the key does not.
+
+MacTime detects that instead of quietly starting over. A small `key-check` file
+next to the database records that the store was sealed under *some* key, so a
+launch that cannot reach that key stops recording and says so, rather than
+minting a fresh key on top of history it can no longer read. Two ways out:
+
+- **Bring the key back** — restore the login keychain the data was sealed under
+  and everything opens again. This is the only way to read existing captures.
+- **Or start over** — Settings ▸ Delete data ▸ Everything. That clears the
+  `key-check` interlock along with the data, and the next launch opens a new
+  encrypted store. The keychain item itself is left alone: MacTime carries on
+  with the key it already has, or makes one if that has gone too.
+
+There is no recovery path that doesn't involve the key. That is what makes the
+encryption worth anything, and it is the trade for the folder no longer being
+readable by everything else on your Mac.
+
+### Deleting
+
 Settings → Delete data erases a single day, a date range, or everything —
 screenshots and activity history together, files as well as rows, and the
 database is compacted afterwards so the deleted rows aren't left readable in
