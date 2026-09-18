@@ -1248,9 +1248,9 @@ struct DockedViewer: View {
             }
     }
 
-    // Both of the actions that hand a capture to something outside MacTime have
-    // to decrypt it first. Passing the stored file along would give Preview,
-    // and the user's chosen save location, a `.jpg` full of ciphertext — the
+    // Every action that hands a capture to something outside MacTime decrypts
+    // it first. Passing the stored file along would give Preview, the Finder,
+    // and the user's chosen save location a `.jpg` full of ciphertext — the
     // failure would be silent and would look like the app corrupting its own
     // screenshots.
     @ViewBuilder
@@ -1259,8 +1259,16 @@ struct DockedViewer: View {
             guard let file = Self.decrypted(shot, into: Store.exportDir) else { return }
             NSWorkspace.shared.open(file)
         }
+        // Reveals the decrypted copy, not the stored file, for the same reason
+        // as the two either side of it. The stored file still ends in `.jpg`,
+        // so revealing it is an invitation to double-click it — the same silent
+        // corruption one step removed, and the harder one to explain because
+        // the Finder is the thing that appears to be failing. Where the data
+        // itself lives is a different question, answered by Settings ▸ Data ▸
+        // Show in Finder, which reveals the folder rather than a capture.
         Button("Show in Finder") {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: shot.path)])
+            guard let file = Self.decrypted(shot, into: Store.exportDir) else { return }
+            NSWorkspace.shared.activateFileViewerSelecting([file])
         }
         Button(images.count > 1 ? "Copy All Displays" : "Copy to Clipboard") {
             guard !images.isEmpty else { return }
@@ -1293,6 +1301,18 @@ struct DockedViewer: View {
     /// Save As… hands one wherever they point it. What bounds it is that
     /// `Store.sweepExports` empties this directory at every launch; 0600 only
     /// keeps out other accounts on the machine, which was never the threat.
+    ///
+    /// The mode is set after the write rather than as the file is created,
+    /// which leaves it at the umask's for an instant. That is the order on
+    /// purpose. `.atomic` is what stops a second export of the same capture
+    /// truncating a file Preview already has open — it replaces by rename, so
+    /// the open copy keeps the inode it was given — and
+    /// `FileManager.createFile(atPath:contents:attributes:)`, which would carry
+    /// the mode in from the start, writes in place instead. The window it
+    /// leaves is not reachable in any case: this directory sits inside
+    /// `$TMPDIR`, which macOS creates per-user at mode 0700, so no other
+    /// account can enter it to find a 0644 file. The 0600 is the belt to that
+    /// directory's braces, not the thing holding the trousers up.
     private static func decrypted(_ shot: ScreenshotRecord, into dir: URL) -> URL? {
         guard let jpeg = jpeg(of: shot) else { return nil }
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
