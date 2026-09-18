@@ -1129,12 +1129,28 @@ await { () async -> Void in
     let nonJpgURL = dir.appendingPathComponent("note.txt")
     try! nonJpgBytes.write(to: nonJpgURL)
 
+    // The two extensions the old case-sensitive `pathExtension == "jpg"` filter
+    // silently skipped, plus a file with no extension at all — all three are
+    // captures in every way that matters except their name.
+    let upperBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x44, count: 30)
+    let upperURL = dir.appendingPathComponent("b.JPG")
+    try! upperBytes.write(to: upperURL)
+
+    let jpegBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x55, count: 30)
+    let jpegURL = dir.appendingPathComponent("c.jpeg")
+    try! jpegBytes.write(to: jpegURL)
+
+    let noExtBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x66, count: 30)
+    let noExtURL = dir.appendingPathComponent("d")
+    try! noExtBytes.write(to: noExtURL)
+
     // Comfortably in the future, so nothing here looks "written since launch".
     let cutoff = Date().addingTimeInterval(3600)
     let summary = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
                                      pauseEvery: 1000, pauseNanoseconds: 0)
 
-    check("Rewrap.files seals both plaintext files", summary.sealed == 2, "got \(summary.sealed)")
+    check("Rewrap.files seals every plaintext file regardless of name",
+          summary.sealed == 5, "got \(summary.sealed)")
     check("Rewrap.files reports no failures", summary.failed == 0, "got \(summary.failed)")
     check("the plaintext file is now sealed on disk",
           Crypto.isSealed(try! Data(contentsOf: plainURL)))
@@ -1151,12 +1167,66 @@ await { () async -> Void in
           Crypto.isSealed(try! Data(contentsOf: nonJpgURL)))
     check("and it opens back to exactly what it held",
           (try? crypto.open(Data(contentsOf: nonJpgURL))) == nonJpgBytes)
+    check("a .JPG (uppercase) file is sealed",
+          Crypto.isSealed(try! Data(contentsOf: upperURL))
+              && (try? crypto.open(Data(contentsOf: upperURL))) == upperBytes)
+    check("a .jpeg file is sealed",
+          Crypto.isSealed(try! Data(contentsOf: jpegURL))
+              && (try? crypto.open(Data(contentsOf: jpegURL))) == jpegBytes)
+    check("a file with no extension at all is sealed",
+          Crypto.isSealed(try! Data(contentsOf: noExtURL))
+              && (try? crypto.open(Data(contentsOf: noExtURL))) == noExtBytes)
 
     let secondPass = await Rewrap.files(in: dir, using: crypto, writtenBefore: cutoff,
                                         pauseEvery: 1000, pauseNanoseconds: 0)
     check("a second pass over an already-sealed directory seals nothing",
           secondPass.sealed == 0 && secondPass.failed == 0,
           "got \(secondPass.sealed) sealed, \(secondPass.failed) failed")
+}()
+
+await { () async -> Void in
+    // `Rewrap.files` is always called on `screenshotsDir`, whose immediate
+    // children are day directories — so the walk must skip directories
+    // themselves (not try to read or seal them, and not report a failure for
+    // them) while still descending into them to find the files inside. And a
+    // symlink must not be followed: the guard is `isRegularFile == true &&
+    // isSymbolicLink != true`, checked against the symlink entry itself, not
+    // its target.
+    let root = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let crypto = Crypto(key: randomKey())
+
+    let dayDir = root.appendingPathComponent("2026-09-01", isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+
+    let nestedBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x77, count: 30)
+    let nestedURL = dayDir.appendingPathComponent("nested.jpg")
+    try! nestedBytes.write(to: nestedURL)
+
+    // The symlink's target lives outside `root` entirely, so if it were ever
+    // followed and rewritten, this check would see it.
+    let outsideDir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: outsideDir) }
+    let targetBytes = Data([0xFF, 0xD8, 0xFF]) + Data(repeating: 0x88, count: 30)
+    let targetURL = outsideDir.appendingPathComponent("target.jpg")
+    try! targetBytes.write(to: targetURL)
+    let linkURL = dayDir.appendingPathComponent("link.jpg")
+    try! FileManager.default.createSymbolicLink(at: linkURL, withDestinationURL: targetURL)
+
+    let cutoff = Date().addingTimeInterval(3600)
+    let summary = await Rewrap.files(in: root, using: crypto, writtenBefore: cutoff,
+                                     pauseEvery: 1000, pauseNanoseconds: 0)
+
+    check("walking a tree where the day folder is a subdirectory seals the file inside it",
+          Crypto.isSealed(try! Data(contentsOf: nestedURL)), "got \(summary.sealed) sealed")
+    check("descending into day directories reports no failures for the directories themselves",
+          summary.failed == 0, "got \(summary.failed)")
+    check("only the nested file is counted — the day directory and the symlink are not",
+          summary.sealed == 1, "got \(summary.sealed)")
+    check("a symlink is not followed: its target is untouched",
+          (try! Data(contentsOf: targetURL)) == targetBytes)
+    check("...and the symlink itself is not rewritten into a regular file",
+          (try? FileManager.default.destinationOfSymbolicLink(atPath: linkURL.path)) == targetURL.path)
 }()
 
 await { () async -> Void in
@@ -1301,6 +1371,90 @@ do {
     } else {
         check("the plaintext title is left exactly as it was, not nulled out", false, "got \(rawTitle)")
     }
+}
+
+// ------------------------------- sealPlaintextSpans judges each column by its own type
+
+do {
+    // A row with one column already sealed (BLOB) and the other forced back to
+    // TEXT — the shape no writer can produce (insertSpan seals both or
+    // neither), and exactly the shape that broke when sealPlaintextSpans read
+    // both columns through Database.text: a BLOB coerced to TEXT comes back as
+    // mojibake truncated at the first zero byte, and got sealed right over the
+    // real value.
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let crypto = Crypto(key: randomKey())
+    let store = Store(directory: dir, crypto: crypto)
+    let dbPath = dir.appendingPathComponent("MacTime.db").path
+
+    let originalTitle = "The Only Copy Of This Title"
+    let originalURL = "https://sealed-and-must-survive.example.com/path"
+    let mixedId = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_000),
+                                   end: Date(timeIntervalSince1970: 1_800_000_060),
+                                   bundleId: "a", appName: "A",
+                                   title: originalTitle, url: originalURL, kind: .active)
+
+    // A second row with a NULL title and a URL forced back to plaintext TEXT
+    // — selected by the batch because `url` is text, and the title column
+    // must stay NULL afterwards rather than becoming an empty sealed blob.
+    let secondURL = "https://second-row.example.com"
+    let nullId = store.insertSpan(start: Date(timeIntervalSince1970: 1_800_000_120),
+                                  end: Date(timeIntervalSince1970: 1_800_000_180),
+                                  bundleId: "a", appName: "A",
+                                  title: nil, url: secondURL, kind: .active)
+
+    // Force `window_title` (row 1) and `url` (row 2) back to plaintext TEXT
+    // through a raw connection — `Store` never writes a bare String into
+    // these columns, so this is the only way to produce the mix.
+    let plainTitle = "Freshly Retyped Title"
+    let raw = Database(path: dbPath)
+    raw.run("UPDATE activity_spans SET window_title = ? WHERE id = ?", bind: [plainTitle, mixedId])
+    raw.run("UPDATE activity_spans SET url = ? WHERE id = ?", bind: [secondURL, nullId])
+    raw.close()
+
+    let sealed = store.sealPlaintextSpans()
+    check("sealPlaintextSpans reseals both rows' plaintext columns",
+          sealed == 2, "got \(sealed)")
+
+    // The check that actually fails against the reverted code: the column
+    // that was already a BLOB before this call must open to the exact same
+    // plaintext afterwards, not to mojibake sealed over the original.
+    let afterMix = store.spans(from: Date(timeIntervalSince1970: 1_799_999_999),
+                               to: Date(timeIntervalSince1970: 1_800_000_400))
+    let byId = Dictionary(uniqueKeysWithValues: afterMix.map { ($0.id, $0) })
+    let mixedRow = byId[mixedId]
+    check("the column that was already sealed still opens to its original plaintext",
+          mixedRow?.url == originalURL, "got \(mixedRow?.url ?? "nil")")
+    check("the column that was still plaintext is now sealed and reads back correctly",
+          mixedRow?.title == plainTitle, "got \(mixedRow?.title ?? "nil")")
+
+    var mixedTitleRaw: Database.Value = .null
+    var mixedUrlRaw: Database.Value = .null
+    let check2 = Database(path: dbPath)
+    check2.run("SELECT window_title, url FROM activity_spans WHERE id = ?", bind: [mixedId]) { s in
+        mixedTitleRaw = Database.value(s, 0)
+        mixedUrlRaw = Database.value(s, 1)
+    }
+    check2.close()
+    if case .blob = mixedTitleRaw {
+        check("the previously-plaintext column is now a BLOB on disk", true)
+    } else {
+        check("the previously-plaintext column is now a BLOB on disk", false, "got \(mixedTitleRaw)")
+    }
+    if case .blob = mixedUrlRaw {
+        check("the already-sealed column is still a BLOB, untouched by the re-seal", true)
+    } else {
+        check("the already-sealed column is still a BLOB, untouched by the re-seal", false, "got \(mixedUrlRaw)")
+    }
+
+    let nullRow = byId[nullId]
+    check("a row where the sealed column is NULL stays NULL rather than becoming an empty sealed blob",
+          nullRow?.title == nil, "got \(nullRow?.title ?? "nil")")
+    check("...and its plaintext column is sealed and reads back correctly",
+          nullRow?.url == secondURL, "got \(nullRow?.url ?? "nil")")
+
+    store.close()
 }
 
 // ------------------------------------------------------- mixed-format DB reads
@@ -1700,6 +1854,54 @@ do {
 }
 
 // ============================================================================
+// URLPolicy.origin — port range checking and bare (unbracketed) IPv6 hosts.
+// A port outside 1...65535 now rejects the whole URL, matching what a
+// non-numeric port already did; a bare IPv6 literal is no longer split at its
+// last colon. Sits alongside the sweep above rather than inside it.
+// ============================================================================
+
+do {
+    struct PortCase { let label: String; let input: String; let expected: String? }
+    let cases: [PortCase] = [
+        .init(label: "a negative port rejects the whole URL",
+              input: "https://example.com:-1/x", expected: nil),
+        .init(label: "a negative port on a bracketed IPv6 host rejects the whole URL too",
+              input: "https://[::1]:-1/x", expected: nil),
+        .init(label: "a port above 65535 rejects the whole URL",
+              input: "https://example.com:99999/x", expected: nil),
+        .init(label: "port 0 rejects the whole URL",
+              input: "https://example.com:0/x", expected: nil),
+        .init(label: "a bare (unbracketed) IPv6 literal is kept whole, not split at its last colon",
+              input: "http://::1/x", expected: "http://[::1]"),
+        .init(label: "a bare IPv6 literal with a numeric-looking tail also stays entirely host",
+              input: "http://::1:8080/x", expected: "http://[::1:8080]"),
+        // Unchanged behaviour — must still hold after the fix.
+        .init(label: "a bracketed IPv6 host with a real port is unaffected",
+              input: "http://[::1]:8080/x", expected: "http://[::1]:8080"),
+        .init(label: "an ordinary host with a valid non-default port is unaffected",
+              input: "https://example.com:3000/a?b=c", expected: "https://example.com:3000"),
+        .init(label: "the default https port is still dropped",
+              input: "https://example.com:443/x", expected: "https://example.com"),
+        .init(label: "userinfo is still stripped alongside a valid port",
+              input: "https://user:pass@h.com/x", expected: "https://h.com"),
+    ]
+
+    for c in cases {
+        let got = URLPolicy.origin(of: c.input)
+        check(c.label, got == c.expected, "got \(got.debugDescription)")
+    }
+
+    // The invariant S1 actually broke: every non-nil result parses back as a
+    // URL. `https://example.com:-1` (the old result for the first case above)
+    // fails this.
+    check("every non-nil result across this sweep parses back as a URL",
+          cases.allSatisfy { c in
+              guard let got = URLPolicy.origin(of: c.input) else { return true }
+              return URL(string: got) != nil
+          })
+}
+
+// ============================================================================
 // CapturePolicy.detail — the exclusion path. What decides whether an app's
 // window title and browser URL are recorded at all.
 // ============================================================================
@@ -1958,6 +2160,70 @@ await { () async -> Void in
           summary.screenshots == 0 && summary.spans == 0)
     check("isSuspended is released after an early-return (empty-range) erase",
           !CaptureSuspension.isSuspended)
+}()
+
+// ============================================================================
+// Erase.data — overlapping erases queue behind each other (`inFlight`),
+// so each reports what its own turn actually removed. Before this, two
+// concurrent erase-everythings both selected the same rows, the first to
+// commit its DELETE took all of them, and the second — the one the user
+// started — reported "Deleted 0" over a store it had just emptied.
+// ============================================================================
+
+await { () async -> Void in
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let store = Store(directory: dir)
+    defer { store.close() }
+
+    // 40 captures of ~4 KB each, all in one day folder, each with its own
+    // span — enough that the erase's database and unlink work actually takes
+    // a moment, which is what gives two concurrent erases room to interleave.
+    let takenAt = Date(timeIntervalSince1970: 1_789_000_000)
+    let dayKey = Format.dayKey.string(from: takenAt)
+    let dayDir = store.screenshotsDir.appendingPathComponent(dayKey, isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+
+    let count = 40
+    let bytes = Data(repeating: 0x42, count: 4096)
+    for i in 0..<count {
+        let at = takenAt.addingTimeInterval(Double(i))
+        let fullURL = dayDir.appendingPathComponent("shot\(i).jpg")
+        let thumbURL = dayDir.appendingPathComponent("shot\(i).thumb.jpg")
+        try! bytes.write(to: fullURL)
+        try! bytes.write(to: thumbURL)
+        store.insertScreenshot(takenAt: at, day: dayKey, displayID: 0,
+                               path: fullURL.path, thumbPath: thumbURL.path, isActive: false)
+        _ = store.insertSpan(start: at, end: at.addingTimeInterval(1),
+                             bundleId: "x", appName: "X", title: nil, url: nil, kind: .active)
+    }
+
+    async let a = Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
+    async let b = Erase.data(from: nil, to: nil, in: store, contents: .capturesAndActivity)
+    let (ra, rb) = await (a, b)
+
+    check("the two overlapping erases together account for every screenshot",
+          ra.screenshots + rb.screenshots == count,
+          "got \(ra.screenshots) + \(rb.screenshots)")
+    check("the two overlapping erases together account for every span",
+          ra.spans + rb.spans == count, "got \(ra.spans) + \(rb.spans)")
+    check("neither overlapping erase reports an unlink failure",
+          ra.failedFiles == 0 && rb.failedFiles == 0,
+          "got \(ra.failedFiles), \(rb.failedFiles)")
+    check("the store is empty after both overlapping erases finish",
+          store.screenshotRows(from: nil, to: nil).isEmpty
+              && store.spans(from: Date(timeIntervalSince1970: 0),
+                             to: Date(timeIntervalSince1970: 2_000_000_000)).isEmpty)
+    // The check that actually pins the fix: queued behind each other, each
+    // erase reports what its own turn removed — one full count and one zero
+    // — rather than both reporting a share of the 40. Against the pre-fix
+    // Erase.swift (both selecting the same rows, no queue) this came back
+    // 0/40: the *first* erase, which had in fact removed everything, reported
+    // nothing.
+    check("exactly one of the two erases reports the full count and the other reports zero",
+          (ra.screenshots == count && rb.screenshots == 0)
+              || (ra.screenshots == 0 && rb.screenshots == count),
+          "got \(ra.screenshots), \(rb.screenshots)")
 }()
 
 // ============================================================================
