@@ -162,7 +162,18 @@ final class ScreenshotService {
             // password manager, which is most of the point of having the shot.
             //
             // Filtered by application rather than by an enumerated window list,
-            // so a window an excluded app opens after this line is still cut.
+            // so a *further* window from an app that was on screen when
+            // `content` was taken is still cut: the filter names the app, not
+            // the windows it happened to have at that instant.
+            //
+            // It does not reach further than that, and the third bullet in
+            // Settings is the accurate statement of the limit. An excluded app
+            // with nothing on screen at enumeration is not in
+            // `content.applications`, so it is not in `excludedApps` either,
+            // and a window it opens between here and the capture lands in that
+            // one frame. There is no excluding an application
+            // `SCShareableContent` did not just report, so this is as far as
+            // the API goes.
             let excluded = Settings.excludedBundleIDs
             let excludedApps = excluded.isEmpty ? []
                 : content.applications.filter { excluded.contains($0.bundleIdentifier) }
