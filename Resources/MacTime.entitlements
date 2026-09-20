@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	The only entitlement the hardened runtime needs for this app. Sending Apple
+	Events from a hardened process is blocked without it, and the failure is
+	silent: NSAppleScript's executeAndReturnError just starts returning an error,
+	BrowserService.activeURL returns nil, and every browser span quietly degrades
+	to title-only. Screen Recording and Accessibility need nothing here — both are
+	gated by TCC alone.
+	-->
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

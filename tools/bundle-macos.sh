@@ -7,9 +7,17 @@
 # UI/ fails to expand. The .app bundle itself is still assembled by hand rather
 # than by xcodebuild, same approach as MonitorDim's bundle-macos.sh.
 #
-# Ad-hoc signed: TCC permission grants (Screen Recording / Accessibility /
-# Automation) are keyed to the signature, so expect to re-grant after rebuilds
-# until there's a real Developer ID.
+# Signed with the hardened runtime (--options runtime): the process refuses
+# injected libraries, unsigned executable memory and debugger attach, so
+# nothing running as the user can borrow this app's Screen Recording and
+# Accessibility grants by injecting into it. That flag blocks Apple Events
+# too, which is what Safari/Chrome URL capture uses — Resources/MacTime
+# .entitlements re-enables exactly that and nothing else. Works with any
+# identity, self-signed included; only notarization needs a paid account.
+#
+# TCC permission grants (Screen Recording / Accessibility / Automation) are
+# keyed to the signature. With the stable "MacTime Dev" identity they survive
+# rebuilds; ad-hoc fallback means re-granting after every rebuild.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -34,7 +42,9 @@ printf 'APPL????' > "$app/Contents/PkgInfo"
 # set-key-partition-list), FAIL — a silent ad-hoc fallback would ship an app
 # whose signature no longer matches the TCC grants.
 if security find-identity -v -p codesigning 2>/dev/null | grep -q "MacTime Dev"; then
-    if ! codesign --force -s "MacTime Dev" "$app"; then
+    if ! codesign --force --options runtime \
+                  --entitlements Resources/MacTime.entitlements \
+                  -s "MacTime Dev" "$app"; then
         echo "error: signing with MacTime Dev failed (keychain not authorized in this session)." >&2
         echo "fix once, on the mac:  security set-key-partition-list -S apple-tool:,apple: -s ~/Library/Keychains/login.keychain-db" >&2
         rm -rf "$app"
@@ -42,7 +52,8 @@ if security find-identity -v -p codesigning 2>/dev/null | grep -q "MacTime Dev";
     fi
     echo "signed: MacTime Dev (stable — permissions survive rebuilds)"
 else
-    codesign --force -s - "$app"
+    codesign --force --options runtime \
+             --entitlements Resources/MacTime.entitlements -s - "$app"
     echo "signed: ad-hoc (permissions reset every rebuild — run tools/make-dev-identity.sh once on the mac)"
 fi
 
