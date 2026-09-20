@@ -4,7 +4,11 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDisplayName</key>
+	<string>MacTime</string>
 	<key>CFBundleExecutable</key>
+	<string>MacTime</string>
+	<key>CFBundleIconFile</key>
 	<string>MacTime</string>
 	<key>CFBundleIdentifier</key>
 	<string>app.mactime</string>
@@ -12,24 +16,20 @@
 	<string>6.0</string>
 	<key>CFBundleName</key>
 	<string>MacTime</string>
-	<key>CFBundleDisplayName</key>
-	<string>MacTime</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.1.1</string>
+	<string>1.2.0</string>
 	<key>CFBundleVersion</key>
-	<string>3</string>
-	<key>CFBundleIconFile</key>
-	<string>MacTime</string>
-	<key>LSMinimumSystemVersion</key>
-	<string>15.0</string>
+	<string>4</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.productivity</string>
-	<key>NSHighResolutionCapable</key>
-	<true/>
+	<key>LSMinimumSystemVersion</key>
+	<string>15.0</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>MacTime reads the active tab address from your browser to attribute time to websites.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
 	<key>NSSupportsAutomaticTermination</key>
 	<false/>
 	<key>NSSupportsSuddenTermination</key>
