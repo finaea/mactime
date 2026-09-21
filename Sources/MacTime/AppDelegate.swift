@@ -20,6 +20,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApp.setActivationPolicy(.accessory)
         NSApp.mainMenu = Self.makeMainMenu()
 
+        // Before the store is built, because it may still have to swap the data
+        // directory back out. An import commits by exchanging two directories
+        // and relaunching; this is the other half of that — the launch that
+        // decides whether the exchange landed.
+        ArchiveImport.resumePending(dataDir: Store.defaultDataDirectory)
+
         store = Store()
         activity = ActivityService(store: store)
         screenshots = ScreenshotService(store: store)
@@ -133,6 +139,32 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         activity.stop()
         screenshots.stop()
         store.close()
+    }
+
+    /// Hand the trackers and the live connection over so an import can swap the
+    /// data directory out from under them.
+    ///
+    /// This lives here because nothing else owns all three. `stop()` on each is
+    /// not enough on its own: a capture round already past the screenshot and
+    /// onto the encode queue still intends to write a file and insert a row, so
+    /// `drain()` waits for it. Everything after this call is running against a
+    /// closed store, which is why the next thing that happens is a relaunch.
+    ///
+    /// Idempotent by luck rather than design, and that is fine: if the exchange
+    /// throws, `commit` puts the marker away and the app carries on with stopped
+    /// trackers until the relaunch it is about to be told to skip — but a failed
+    /// exchange means nothing moved, so quitting and reopening is a complete
+    /// recovery.
+    @MainActor
+    func commitImport(staging: URL, incoming: Archive.SettingsPayload,
+                      expected: Archive.Manifest) throws {
+        try ArchiveImport.commit(store: store, staging: staging, incoming: incoming,
+                                 expected: expected) { [self] in
+            activity.stop()
+            screenshots.stop()
+            screenshots.drain()
+            store.close()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {

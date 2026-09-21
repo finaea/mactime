@@ -1,3 +1,4 @@
+import AppKit
 import CryptoKit
 import Foundation
 
@@ -2349,6 +2350,302 @@ do {
           !crypto.isReady)
     check("an unreadable key-check file: create() is never called over it",
           !createCalled)
+}
+
+// ----------------------------------------------------- archive: settings rule
+//
+// Neither "replace" nor "merge": an import may never weaken a privacy setting
+// and never strand data outside the retention window, so a handful of keys
+// resolve against the destination rather than taking the archive's value.
+// Checked as a pure function, which is why `Archive.merge` is one.
+
+do {
+    func payload(excluded: [String] = [], reviewed: Bool = false, retention: Int = 14,
+                 fullURLs: Bool = false, browser: Bool = true, lock: Bool = false,
+                 quality: Double = 0.6) -> Archive.SettingsPayload {
+        Archive.SettingsPayload(
+            excludedBundleIDs: excluded, excludedAppsReviewed: reviewed,
+            screenshotRetentionDays: retention, captureFullURLs: fullURLs,
+            browserTrackingEnabled: browser, requireAuthentication: lock,
+            idleThresholdSeconds: 300, screenshotIntervalSeconds: 15,
+            screenshotQuality: quality, hoverPreviewOffsetX: -8, hoverPreviewOffsetY: -8,
+            showAllDisplays: false)
+    }
+
+    let merged = Archive.merge(incoming: payload(excluded: ["com.1password"], retention: 90),
+                               into: payload(excluded: ["com.signal"], retention: 14))
+    check("import unions the exclusion list rather than replacing it",
+          merged.excludedBundleIDs == ["com.1password", "com.signal"],
+          "got \(merged.excludedBundleIDs)")
+    check("import never drops an exclusion this Mac had added",
+          merged.excludedBundleIDs.contains("com.signal"))
+    check("retention takes the larger, so imported history isn't pruned on arrival",
+          merged.screenshotRetentionDays == 90, "got \(merged.screenshotRetentionDays)")
+
+    // The three privacy toggles resolve towards recording less / asking more,
+    // whichever side holds that value.
+    check("full-URL capture stays off if either side has it off",
+          !Archive.merge(incoming: payload(fullURLs: true), into: payload(fullURLs: false)).captureFullURLs)
+    check("full-URL capture stays off even when the archive is the cautious one",
+          !Archive.merge(incoming: payload(fullURLs: false), into: payload(fullURLs: true)).captureFullURLs)
+    check("browser tracking stays off if either side has it off",
+          !Archive.merge(incoming: payload(browser: true), into: payload(browser: false))
+              .browserTrackingEnabled)
+    check("an import never switches this Mac's lock off",
+          Archive.merge(incoming: payload(lock: false), into: payload(lock: true))
+              .requireAuthentication)
+    check("an import can switch the lock on",
+          Archive.merge(incoming: payload(lock: true), into: payload(lock: false))
+              .requireAuthentication)
+    check("the first-run exclusion prompt stays answered if either side answered it",
+          Archive.merge(incoming: payload(reviewed: false), into: payload(reviewed: true))
+              .excludedAppsReviewed)
+
+    // Everything with no privacy or retention argument simply travels.
+    check("ordinary preferences take the archive's value",
+          Archive.merge(incoming: payload(quality: 0.8), into: payload(quality: 0.6))
+              .screenshotQuality == 0.8)
+}
+
+// ----------------------------------------------------------- archive: the zip
+//
+// `ditto` was measured writing spec-violating archives past 65,535 entries — it
+// wraps the 16-bit entry count and emits no Zip64 record — so the container is
+// built with /usr/bin/zip and read back through its own central directory
+// rather than trusted. These check that the reader actually notices.
+
+do {
+    let dir = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: dir) }
+    let tree = dir.appendingPathComponent("tree", isDirectory: true)
+    try! FileManager.default.createDirectory(at: tree.appendingPathComponent("screenshots/2026-09-21"),
+                                             withIntermediateDirectories: true)
+    try! Data("one".utf8).write(to: tree.appendingPathComponent("screenshots/2026-09-21/a.jpg"))
+    try! Data("two".utf8).write(to: tree.appendingPathComponent("screenshots/2026-09-21/b.jpg"))
+    try! Data("{}".utf8).write(to: tree.appendingPathComponent("manifest.json"))
+
+    let archive = dir.appendingPathComponent("out.zip")
+    let expected: Set<String> = ["screenshots/2026-09-21/a.jpg",
+                                 "screenshots/2026-09-21/b.jpg", "manifest.json"]
+    do {
+        try Zip.append(["screenshots/2026-09-21"], from: tree, to: archive, compress: false)
+        try Zip.append(["manifest.json"], from: tree, to: archive, compress: true)
+        let names = Set(try Zip.entryNames(in: archive))
+        check("the central directory lists exactly the files that went in",
+              names == expected, "got \(names.sorted())")
+        // -D: no directory entries, which is most of what a day folder would add.
+        check("no directory entries are stored",
+              !names.contains { $0.hasSuffix("/") })
+        try Zip.verify(archive, holdsExactly: expected)
+        check("verify accepts an archive holding exactly what was expected", true)
+    } catch {
+        check("zip round-trip", false, "\(error)")
+    }
+
+    var rejected = false
+    do { try Zip.verify(archive, holdsExactly: expected.union(["screenshots/2026-09-21/c.jpg"])) }
+    catch { rejected = true }
+    check("verify rejects an archive missing an expected entry", rejected)
+
+    rejected = false
+    do { try Zip.verify(archive, holdsExactly: ["manifest.json"]) }
+    catch { rejected = true }
+    check("verify rejects an archive holding something unexpected", rejected)
+
+    // A cancelled or disk-full export is a truncated file, and that is the
+    // failure mode the structural check exists to catch: the end-of-central-
+    // directory record is the last thing written, so losing the tail loses it.
+    rejected = false
+    let truncated = dir.appendingPathComponent("truncated.zip")
+    let whole = try! Data(contentsOf: archive)
+    try! whole.prefix(whole.count / 2).write(to: truncated)
+    do { _ = try Zip.entryNames(in: truncated) } catch { rejected = true }
+    check("a truncated archive is refused rather than silently under-reported", rejected)
+
+    // `Zip.read` pulls one entry without unpacking the rest — how the manifest
+    // is read before the user is asked to confirm anything.
+    let manifestBytes = try? Zip.read("manifest.json", from: archive)
+    check("a single entry can be read without extracting the archive",
+          manifestBytes == Data("{}".utf8))
+}
+
+// ------------------------------------------------- archive: export and import
+//
+// The whole promise, end to end: everything sealed under one key comes back
+// sealed under another, with the titles and URLs intact. Deliberately uses a
+// title carrying a comma, a quote and a newline — the characters that made a
+// CSV format untenable and that JSON has to escape onto one physical line.
+
+do {
+    let suiteName = "mactime-tests-\(UUID().uuidString)"
+    let previousDefaults = Settings.d
+    defer {
+        UserDefaults.standard.removePersistentDomain(forName: suiteName)
+        Settings.d = previousDefaults
+    }
+    Settings.d = UserDefaults(suiteName: suiteName)!
+    Settings.registerDefaults()
+
+    let root = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let sourceDir = root.appendingPathComponent("MacTime", isDirectory: true)
+    try! FileManager.default.createDirectory(at: sourceDir, withIntermediateDirectories: true)
+
+    let sourceCrypto = Crypto(key: randomKey())
+    let store = Store(directory: sourceDir, crypto: sourceCrypto)
+
+    let awkwardTitle = "Q3 \"Layoff\", plan\nsecond line"
+    let takenAt = Date(timeIntervalSince1970: 1_789_000_000)
+    _ = store.insertSpan(start: takenAt, end: takenAt.addingTimeInterval(60),
+                         bundleId: "com.apple.Safari", appName: "Safari",
+                         title: awkwardTitle, url: "https://example.com/a?b=c",
+                         kind: .active)
+    _ = store.insertSpan(start: takenAt.addingTimeInterval(60), end: takenAt.addingTimeInterval(120),
+                         bundleId: "com.apple.Terminal", appName: "Terminal",
+                         title: nil, url: nil, kind: .idle)
+
+    // A real JPEG, because import regenerates the thumbnail by decoding it.
+    func tinyJPEG() -> Data {
+        let ctx = CGContext(data: nil, width: 240, height: 160, bitsPerComponent: 8,
+                            bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.setFillColor(CGColor(red: 0.2, green: 0.6, blue: 0.9, alpha: 1))
+        ctx.fill(CGRect(x: 0, y: 0, width: 240, height: 160))
+        return Thumbnail.jpeg(ctx.makeImage()!, quality: 0.8)!
+    }
+
+    let day = Format.dayKey.string(from: takenAt)
+    let dayDir = store.screenshotsDir.appendingPathComponent(day, isDirectory: true)
+    try! FileManager.default.createDirectory(at: dayDir, withIntermediateDirectories: true)
+    let jpeg = tinyJPEG()
+    let capturePath = dayDir.appendingPathComponent("09-30-15_1.jpg")
+    try! sourceCrypto.seal(jpeg).write(to: capturePath)
+    try! sourceCrypto.seal(Thumbnail.ofJPEG(jpeg)!)
+        .write(to: dayDir.appendingPathComponent("09-30-15_1.thumb.jpg"))
+    store.insertScreenshot(takenAt: takenAt, day: day, displayID: 1,
+                           path: capturePath.path,
+                           thumbPath: dayDir.appendingPathComponent("09-30-15_1.thumb.jpg").path,
+                           isActive: true)
+
+    let archive = root.appendingPathComponent("export.zip")
+    var exported: ArchiveExport.Summary?
+    do {
+        exported = try await ArchiveExport.run(store: store, to: archive,
+                                               progress: { _, _ in }, isCancelled: { false })
+    } catch {
+        check("export runs", false, "\(error)")
+    }
+    check("export reports the capture it wrote", exported?.captures == 1,
+          "got \(exported?.captures ?? -1)")
+    check("export reports both spans", exported?.spans == 2, "got \(exported?.spans ?? -1)")
+    check("export leaves no partial file beside the destination",
+          !((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? [])
+              .contains { $0.hasSuffix(".partial") })
+    check("export records when it happened", Settings.lastExportedAt != nil)
+
+    // The archive names a capture file and carries it: the entry set and the
+    // record stream have to agree, or import would restore rows pointing at
+    // nothing.
+    let names = Set((try? Zip.entryNames(in: archive)) ?? [])
+    check("the archive carries its four metadata files",
+          names.isSuperset(of: [Archive.manifestEntry, Archive.settingsEntry,
+                                Archive.spansEntry, Archive.capturesEntry]))
+    check("the archive carries the capture itself",
+          names.contains("screenshots/\(day)/09-30-15_1.jpg"))
+    check("thumbnails are not carried — they are regenerated on import",
+          !names.contains { $0.contains(".thumb.") })
+
+    // ------------------------------------------------- import into a new store
+
+    let destDir = root.appendingPathComponent("Destination", isDirectory: true)
+    try! FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
+    let destCrypto = Crypto(key: randomKey())     // a *different* key, as a new Mac would have
+    let destStore = Store(directory: destDir, crypto: destCrypto)
+    try! Data("destination key-check stand-in".utf8)
+        .write(to: destDir.appendingPathComponent(Crypto.checkFileName))
+
+    var staging: URL?
+    do {
+        let preview = try ArchiveImport.preview(archive)
+        check("the manifest reports the counts the export wrote",
+              preview.manifest.captureCount == 1 && preview.manifest.spanCount == 2)
+        staging = try await ArchiveImport.stage(store: destStore, from: archive, preview: preview,
+                                                progress: { _, _ in }, isCancelled: { false })
+    } catch {
+        check("import stages", false, "\(error)")
+    }
+    destStore.close()
+
+    if let staging {
+        check("staging lands beside the destination, not inside it",
+              staging.deletingLastPathComponent().path == destDir.deletingLastPathComponent().path)
+        // The destination's own key-check is carried across, because the commit
+        // swaps whole directories — the archive's is never unpacked, since a
+        // check file this Mac's key can't open makes Crypto.resolve refuse to
+        // record for good.
+        let stagedCheck = staging.appendingPathComponent(Crypto.checkFileName)
+        check("the destination's key-check is carried into staging",
+              (try? Data(contentsOf: stagedCheck)) == Data("destination key-check stand-in".utf8))
+
+        let staged = Store(directory: staging, crypto: destCrypto)
+        let spans = staged.spans(from: takenAt.addingTimeInterval(-3600),
+                                 to: takenAt.addingTimeInterval(3600))
+        check("both spans survive the round trip", spans.count == 2, "got \(spans.count)")
+        check("a title with a comma, a quote and a newline comes back byte-identical",
+              spans.first?.title == awkwardTitle, "got \(spans.first?.title ?? "nil")")
+        check("the URL comes back intact",
+              spans.first?.url == "https://example.com/a?b=c")
+        check("a span that never had a title still has none",
+              spans.count == 2 && spans[1].title == nil)
+        check("span kinds survive", spans.count == 2 && spans[1].kind == .idle)
+
+        let shots = staged.screenshots(from: takenAt.addingTimeInterval(-3600),
+                                       to: takenAt.addingTimeInterval(3600))
+        check("the capture survives the round trip", shots.count == 1)
+        check("the capture keeps which display held the focused window",
+              shots.first?.isActive == true && shots.first?.displayID == 1)
+
+        // Re-sealed under the destination key — the point of the whole exercise.
+        if let shot = shots.first, let sealed = try? Data(contentsOf: URL(fileURLWithPath: shot.path)) {
+            check("the restored capture is sealed, not plaintext", Crypto.isSealed(sealed))
+            check("the restored capture opens with the destination's key",
+                  (try? destCrypto.open(sealed)) == jpeg)
+            check("the restored capture does NOT open with the source's key",
+                  (try? sourceCrypto.open(sealed)) == nil)
+        } else {
+            check("the restored capture is readable", false)
+        }
+        check("a thumbnail was regenerated for the restored capture",
+              shots.first.map { FileManager.default.fileExists(atPath: $0.thumbPath) } == true)
+        staged.close()
+    }
+}
+
+// ------------------------------------------- archive: import refuses with no key
+//
+// Import has to seal everything it unpacks. Without a key the alternatives are
+// writing the store in the clear or minting a replacement over sealed data, so
+// it stops instead — and stops early, before anything of the user's is at risk.
+
+do {
+    let root = makeTempStoreDir()
+    defer { try? FileManager.default.removeItem(at: root) }
+    let dir = root.appendingPathComponent("MacTime", isDirectory: true)
+    try! FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    let locked = Store(directory: dir, crypto: Crypto(unavailable: "no key for this check"))
+
+    var refused = false
+    var reason = ""
+    do {
+        _ = try Archive.requireKey(locked.crypto)
+    } catch {
+        refused = true
+        reason = (error as? LocalizedError)?.errorDescription ?? ""
+    }
+    check("a store with no usable key refuses to import", refused)
+    check("the refusal repeats the reason the user was already given",
+          reason == "no key for this check", "got \(reason)")
+    locked.close()
 }
 
 // ------------------------------------------------------------------- report

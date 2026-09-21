@@ -76,9 +76,17 @@ final class Store {
     /// that needs a particular key with a particular directory passes one —
     /// which is also how a check reopens a store: a fresh throwaway key cannot
     /// read what the last one wrote, so the same `Crypto` has to come back in.
+    /// Where the real store lives. A static because `ArchiveImport.resumePending`
+    /// has to find it at launch *before* a `Store` exists — it may be about to
+    /// swap the directory back out — and two copies of this path that could
+    /// drift apart is the last thing an import-recovery path needs.
+    static var defaultDataDirectory: URL {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("MacTime", isDirectory: true)
+    }
+
     init(directory: URL? = nil, crypto: Crypto? = nil) {
-        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        dataDir = directory ?? appSupport.appendingPathComponent("MacTime", isDirectory: true)
+        dataDir = directory ?? Self.defaultDataDirectory
         screenshotsDir = dataDir.appendingPathComponent("Screenshots", isDirectory: true)
         try? FileManager.default.createDirectory(at: screenshotsDir, withIntermediateDirectories: true)
         self.crypto = crypto ?? (directory == nil
@@ -129,6 +137,15 @@ final class Store {
     }
 
     func close() { db.close() }
+
+    /// The connection, lent to `Store+Archive`.
+    ///
+    /// Export and import need streaming queries and a bulk transaction, which
+    /// would otherwise mean either duplicating every accessor here or making
+    /// `db` internal. Lending it through a closure keeps the handle from
+    /// escaping: nothing outside this type can hold one past the call.
+    @discardableResult
+    func withDatabase<T>(_ body: (Database) -> T) -> T { body(db) }
 
     private func migrate() {
         db.exec("""

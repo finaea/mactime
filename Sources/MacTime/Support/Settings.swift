@@ -64,6 +64,11 @@ enum Settings {
         static let screenshotIntervalSeconds = "screenshotIntervalSeconds"
         static let screenshotRetentionDays = "screenshotRetentionDays"
         static let screenshotQuality = "screenshotQuality"
+        /// When the history was last written out. Deliberately *not* carried in
+        /// an archive's `settings.json`: an imported store showing the source
+        /// Mac's export date would be telling its new owner they have a backup
+        /// they never made.
+        static let lastExportedAt = "lastExportedAt"
     }
 
     static var trackingEnabled: Bool { d.bool(forKey: Key.trackingEnabled) }
@@ -94,4 +99,15 @@ enum Settings {
     static var hoverPreviewOffsetX: Double { d.double(forKey: Key.hoverPreviewOffsetX) }
     static var hoverPreviewOffsetY: Double { d.double(forKey: Key.hoverPreviewOffsetY) }
     static var showAllDisplays: Bool { d.bool(forKey: Key.showAllDisplays) }
+
+    /// nil until the first export.
+    ///
+    /// This number carries more weight than a preference. MacTime has no
+    /// recovery code, so the data key living in the login keychain is the only
+    /// way into the history — and an export is the only copy that survives that
+    /// keychain going away. The gap since the last one is the amount of history
+    /// a dead keychain would cost, which is why Settings shows it rather than
+    /// leaving it to be discovered.
+    static var lastExportedAt: Date? { d.object(forKey: Key.lastExportedAt) as? Date }
+    static func setLastExportedAt(_ date: Date) { d.set(date, forKey: Key.lastExportedAt) }
 }

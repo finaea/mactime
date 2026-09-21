@@ -26,6 +26,7 @@
 - **Makes the day easy to review** — The Day tab combines screenshots, app activity, time selection, a screenshot viewer, and a daily summary. The timeline can be zoomed and moved to focus on any part of the day.
 - **Provides useful statistics** — The Statistics tab includes time-range presets, daily usage, top applications, computer usage, and an attendance-style calendar.
 - **Runs quietly when needed** — MacTime can start from the menu bar and continue tracking after its main window is closed. Starting at login is optional.
+- **Exports and imports the whole history** — One zip of ordinary JPEGs and JSON, for moving to a new Mac, keeping a backup, or leaving MacTime with your data intact.
 
 MacTime is designed as a record, not a productivity system. It does not include projects, tags, timers, notes, timesheets, or invoicing.
 
@@ -70,7 +71,36 @@ MacTime keeps its history on the Mac. It has no account, sync service, analytics
 
 Screenshots, window titles, and browser websites are encrypted before MacTime saves them. The encryption key stays in the Mac’s login keychain, so other apps cannot read those protected details simply by opening MacTime’s history files.
 
-The key remains on the Mac where the history was created. Copying the MacTime data folder to another Mac does not make the history readable there. If the key is unavailable, MacTime stops recording rather than creating a separate unreadable history. Existing history can be opened only by restoring the original login keychain; otherwise, Settings → Delete data → Everything starts a new history.
+The key remains on the Mac where the history was created. Copying the MacTime data folder to another Mac does not make the history readable there. If the key is unavailable, MacTime stops recording rather than creating a separate unreadable history. Existing history can be opened only by restoring the original login keychain, or by importing an export made beforehand; otherwise, Settings → Delete data → Everything starts a new history.
+
+### Moving to a new Mac
+
+Migration Assistant and a full Time Machine restore both work without any extra step, because both carry the login keychain along with the history.
+
+For anything else — a clean install, a keychain reset, or simply moving the history somewhere a keychain does not reach — use **Settings → Backup**:
+
+| | |
+|---|---|
+| **Export…** | Writes the whole history to one zip. Asks for Touch ID or your password first. |
+| **Import…** | Replaces everything recorded on this Mac with the contents of an export, then restarts MacTime. Also asks first. |
+
+Settings shows how long it has been since the last export. That gap matters more than it looks: MacTime has no recovery code, so an export is the only copy of the history that survives losing this Mac's keychain.
+
+**The export is not encrypted.** That is deliberate — it is what lets the data outlive MacTime, and what makes leaving for another app possible at all — but it means the file holds every screenshot and window title in the open. Keep it somewhere you would keep the originals; put it in an encrypted disk image if it is going to travel.
+
+### Export format
+
+Documented because an export nobody can read without MacTime is not portability. The zip holds:
+
+```
+manifest.json       format version, counts, date range, app version
+settings.json       excluded apps, retention, website detail
+activity.jsonl      one JSON object per line: start, end, app bundle id, app name, title, url, kind
+screenshots.jsonl   one JSON object per line: taken_at, day, display_id, is_active, file
+screenshots/<day>/  the captures themselves, as ordinary JPEGs
+```
+
+Timestamps are ISO 8601. The two record streams are [JSON Lines](https://jsonlines.org) rather than one array, so both MacTime and anything else can read them a record at a time — activity history is never pruned, so those files grow for as long as the install lives. Thumbnails are not included; MacTime regenerates them on import.
 
 ### Privacy controls
 

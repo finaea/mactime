@@ -27,9 +27,10 @@ import Security
 /// TCC grants. Pinning the key the same way means every rebuild orphans it, and
 /// an orphaned key is not an inconvenience — it is every screenshot ever
 /// captured, permanently unreadable. That is a far worse outcome than the
-/// injection threat a tighter ACL would buy defence against, particularly while
-/// the hardened runtime isn't in place, so a process that can read the key from
-/// this app's memory doesn't need the keychain at all.
+/// injection threat a tighter ACL would buy defence against — a threat the
+/// hardened runtime (`--options runtime`, in tools/bundle-macos.sh) now takes
+/// most of the cost out of anyway, since a process that could read the key from
+/// this app's memory would no longer be able to get in there to try.
 ///
 /// What the default ACL costs an attacker is still the thing that matters here:
 /// another process reading the item gets a keychain prompt asking for the login
@@ -46,8 +47,21 @@ import Security
 ///   lost either way — a dismissed prompt is `errSecAuthFailed`, which
 ///   `Crypto.resolve` treats as "come back later", never as "mint a new key".
 ///
+/// ## What `ThisDeviceOnly` does and does not buy
+///
 /// `kSecAttrAccessibleWhenUnlockedThisDeviceOnly` keeps the key off iCloud
-/// Keychain and out of any backup that could restore it onto another machine.
+/// Keychain. It does **not** keep it out of backups, and it is worth being
+/// precise about that rather than claiming otherwise: the attribute is a
+/// data-protection-keychain concept, and this item is in the file keychain by
+/// necessity (above). It lives in `~/Library/Keychains/login.keychain-db`, which
+/// Migration Assistant and Time Machine both copy — which is exactly why
+/// migrating a Mac carries the history across and a keychain restore brings it
+/// back. What the attribute rules out is the key syncing to another machine
+/// behind the user's back; moving it deliberately still works, and the README
+/// says so.
+///
+/// Anyone wanting the history somewhere a keychain won't reach should use
+/// Settings ▸ Backup ▸ Export — see `ArchiveExport`.
 enum DataKeychain {
     private static let service = "MacTime"
     /// Versioned so a future key-rotation scheme can add one rather than

@@ -68,6 +68,17 @@ final class ScreenshotService {
         captureTask?.cancel()
     }
 
+    /// Block until the encode queue is empty.
+    ///
+    /// `stop()` cancels the capture task, but a round already past the capture
+    /// and onto the encode queue is holding a 5K frame it still intends to seal
+    /// and write. Import has to know that has finished before it swaps the data
+    /// directory out — otherwise the write lands in a directory that is no
+    /// longer the store, and the row that follows it lands in a database that is
+    /// no longer open. A barrier, not a sleep: the queue is serial, so an empty
+    /// block behind everything queued returns exactly when they are done.
+    func drain() { encodeQueue.sync {} }
+
     private func tick() {
         let now = Date()
 
@@ -222,9 +233,8 @@ final class ScreenshotService {
         let thumbURL = dayDir.appendingPathComponent(base + ".thumb.jpg")
 
         encodeQueue.async { [store] in
-            guard let full = Self.jpegData(image, quality: quality),
-                  let thumbImage = Self.scaled(image, toHeight: 120),
-                  let thumb = Self.jpegData(thumbImage, quality: 0.7) else {
+            guard let full = Thumbnail.jpeg(image, quality: quality),
+                  let thumb = Thumbnail.of(image) else {
                 NSLog("MacTime: jpeg encode failed for %@", base)
                 return
             }
@@ -273,24 +283,6 @@ final class ScreenshotService {
         }
     }
 
-    private static func jpegData(_ image: CGImage, quality: Double) -> Data? {
-        let rep = NSBitmapImageRep(cgImage: image)
-        return rep.representation(using: .jpeg, properties: [.compressionFactor: quality as NSNumber])
-    }
-
-    private static func scaled(_ image: CGImage, toHeight height: Int) -> CGImage? {
-        let w = image.width, h = image.height
-        guard h > 0 else { return nil }
-        let outH = height
-        let outW = max(1, w * outH / h)
-        guard let ctx = CGContext(data: nil, width: outW, height: outH,
-                                  bitsPerComponent: 8, bytesPerRow: 0,
-                                  space: CGColorSpaceCreateDeviceRGB(),
-                                  bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        ctx.interpolationQuality = .medium
-        ctx.draw(image, in: CGRect(x: 0, y: 0, width: outW, height: outH))
-        return ctx.makeImage()
-    }
 
     // ------------------------------------------------------------- retention
 

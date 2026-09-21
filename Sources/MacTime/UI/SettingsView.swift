@@ -37,6 +37,24 @@ struct SettingsView: View {
     @State private var erasing = false
     @State private var eraseResult: String?
 
+    // ----------------------------------------------------------- backup
+    @State private var lastExported: Date? = Settings.lastExportedAt
+    /// Non-nil while an export or import is running; the string is what to show.
+    @State private var busy: String?
+    @State private var busyFraction: Double = 0
+    @State private var cancelRequested = false
+    @State private var backupResult: String?
+    @State private var confirmingImport = false
+    @State private var importTitle = ""
+    @State private var importMessage = ""
+    @State private var pendingImport: PendingImport?
+
+    /// An archive the user picked, held between the confirmation and the work.
+    struct PendingImport {
+        let url: URL
+        let preview: ArchiveImport.Preview
+    }
+
     var body: some View {
         Form {
             Section("Activity tracking") {
@@ -140,6 +158,7 @@ struct SettingsView: View {
                 appLock
             }
 
+            backupSection
             deleteSection
         }
         .formStyle(.grouped)
@@ -151,6 +170,206 @@ struct SettingsView: View {
         } message: {
             Text(confirmMessage)
         }
+        .confirmationDialog(importTitle, isPresented: $confirmingImport, titleVisibility: .visible) {
+            Button("Replace and Restart", role: .destructive) { Task { await performImport() } }
+            Button("Cancel", role: .cancel) { pendingImport = nil }
+        } message: {
+            Text(importMessage)
+        }
+    }
+
+    // ----------------------------------------------------------- backup
+
+    private var backupSection: some View {
+        Section("Backup") {
+            Text("Export writes your whole history to a single zip — screenshots as JPEGs, "
+                 + "activity as JSON. Import replaces everything on this Mac with the contents "
+                 + "of one. Both ask for Touch ID or your password first.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            LabeledContent("Last exported", value: lastExportedDescription)
+
+            // Said here rather than only at the save panel. MacTime has no
+            // recovery code, so this export is the only copy of the history that
+            // survives the login keychain going away — and the archive it writes
+            // is unencrypted, which is the trade that buys the portability.
+            Text(lastExported == nil
+                 ? "MacTime's history can only be read on this Mac, with this Mac's keychain. An export is the only copy that survives losing either — and it is not encrypted, so keep it somewhere you trust."
+                 : "An export is the only copy of your history that survives losing this Mac's keychain. Exports are not encrypted, so keep them somewhere you trust.")
+                .font(.caption)
+                .foregroundStyle(lastExportedIsStale ? .orange : .secondary)
+
+            if let busy {
+                HStack(spacing: 8) {
+                    ProgressView(value: busyFraction).frame(width: 140)
+                    Text(busy).font(.caption).foregroundStyle(.secondary)
+                    Spacer()
+                    Button("Cancel") { cancelRequested = true }
+                        .controlSize(.small)
+                        .disabled(cancelRequested)
+                }
+            } else {
+                HStack {
+                    Button("Export…") { beginExport() }
+                    Button("Import…") { beginImport() }
+                    Spacer()
+                }
+            }
+
+            if let backupResult {
+                Text(backupResult).font(.caption).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var lastExportedDescription: String {
+        guard let lastExported else { return "Never" }
+        let days = Calendar.current.dateComponents([.day], from: lastExported, to: Date()).day ?? 0
+        switch days {
+        case 0: return "Today"
+        case 1: return "Yesterday"
+        default: return "\(days) days ago"
+        }
+    }
+
+    /// Four weeks. Not a rule about how often anyone should export — just the
+    /// point where "how much would a dead keychain cost me" stops being a
+    /// rhetorical question.
+    private var lastExportedIsStale: Bool {
+        guard let lastExported else { return true }
+        return Date().timeIntervalSince(lastExported) > 28 * 24 * 3600
+    }
+
+    /// Touch ID on the way out as well as in.
+    ///
+    /// Export only reads, but what it produces is every screenshot and window
+    /// title in the clear in one file — the difference between someone at an
+    /// unlocked Mac being able to *look* at the history and being able to *take*
+    /// it. Deliberately not wired to `Settings.requireAuthentication`, which is
+    /// off by default: a gate most users never turn on is not a gate.
+    private func authenticated(_ reason: String, then work: @escaping () -> Void) {
+        backupResult = nil
+        AppLock.authenticate(reason: reason) { ok in
+            guard ok else { return }
+            work()
+        }
+    }
+
+    private func beginExport() {
+        authenticated("export your MacTime history") {
+            let panel = NSSavePanel()
+            panel.nameFieldStringValue = "MacTime-\(Format.dayKey.string(from: Date())).zip"
+            panel.allowedContentTypes = [.zip]
+            panel.message = "This archive is not encrypted. It holds every screenshot and "
+                + "window title MacTime has recorded, readable by anything that opens it."
+            panel.begin { response in
+                guard response == .OK, let url = panel.url else { return }
+                Task { await runExport(to: url) }
+            }
+        }
+    }
+
+    @MainActor
+    private func runExport(to url: URL) async {
+        busy = "Starting…"
+        busyFraction = 0
+        cancelRequested = false
+        defer { busy = nil }
+        do {
+            let summary = try await ArchiveExport.run(
+                store: store, to: url,
+                progress: { fraction, label in
+                    busyFraction = fraction
+                    busy = label
+                },
+                isCancelled: { cancelRequested })
+            lastExported = Settings.lastExportedAt
+            let size = ByteCountFormatter.string(fromByteCount: summary.bytes, countStyle: .file)
+            backupResult = "Exported \(summary.captures) screenshots and "
+                + "\(summary.spans) activity entries — \(size)."
+        } catch {
+            backupResult = message(for: error)
+        }
+    }
+
+    private func beginImport() {
+        authenticated("replace your MacTime history from a backup") {
+            let panel = NSOpenPanel()
+            panel.allowedContentTypes = [.zip]
+            panel.allowsMultipleSelection = false
+            panel.message = "Choose a MacTime export. Everything currently recorded on this Mac "
+                + "will be replaced."
+            panel.begin { response in
+                guard response == .OK, let url = panel.url else { return }
+                prepareImport(from: url)
+            }
+        }
+    }
+
+    /// Read the archive's manifest and count both sides *before* asking.
+    ///
+    /// The same shape as `confirmErase`: the prompt names what will actually
+    /// go and what will arrive, rather than asking someone to confirm an
+    /// unknown. The restart is named too — an app that vanishes mid-operation
+    /// without having said it would is indistinguishable from a crash.
+    private func prepareImport(from url: URL) {
+        do {
+            let preview = try ArchiveImport.preview(url)
+            let here = store.counts(from: nil, to: nil)
+            pendingImport = PendingImport(url: url, preview: preview)
+            importTitle = "Replace everything recorded on this Mac?"
+
+            let arriving = "\(preview.manifest.captureCount) screenshots and "
+                + "\(preview.manifest.spanCount) activity entries"
+            let leaving = here.screenshots + here.spans == 0
+                ? "Nothing is recorded here yet"
+                : "This replaces \(here.screenshots) screenshots and \(here.spans) activity entries"
+            let span = [preview.manifest.firstRecord, preview.manifest.lastRecord]
+                .compactMap { $0 }
+            let range = span.count == 2
+                ? " recorded between \(Format.dayHeading.string(from: span[0])) and "
+                    + "\(Format.dayHeading.string(from: span[1]))"
+                : ""
+            importMessage = "\(leaving). The archive holds \(arriving)\(range). "
+                + "MacTime will restart to finish. This can't be undone."
+            confirmingImport = true
+        } catch {
+            backupResult = message(for: error)
+        }
+    }
+
+    @MainActor
+    private func performImport() async {
+        guard let pending = pendingImport else { return }
+        pendingImport = nil
+        busy = "Starting…"
+        busyFraction = 0
+        cancelRequested = false
+        do {
+            let staging = try await ArchiveImport.stage(
+                store: store, from: pending.url, preview: pending.preview,
+                progress: { fraction, label in
+                    busyFraction = fraction
+                    busy = label
+                },
+                isCancelled: { cancelRequested })
+            busy = "Restarting MacTime…"
+            busyFraction = 1
+            // Everything up to here has been reversible. This is the line that
+            // isn't: it swaps the directories and relaunches, so nothing below
+            // it runs in this process.
+            try (NSApp.delegate as? AppDelegate)?.commitImport(
+                staging: staging, incoming: pending.preview.settings,
+                expected: pending.preview.manifest)
+        } catch {
+            busy = nil
+            backupResult = message(for: error)
+        }
+    }
+
+    private func message(for error: Error) -> String {
+        (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
     }
 
     // ----------------------------------------------------------- excluded apps

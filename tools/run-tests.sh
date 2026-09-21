@@ -34,12 +34,18 @@ swiftc -swift-version 5 -target arm64-apple-macos15.0 \
     Sources/MacTime/Support/Settings.swift \
     Sources/MacTime/Support/TimeMath.swift \
     Sources/MacTime/Support/ImageCache.swift \
+    Sources/MacTime/Support/Thumbnail.swift \
     Sources/MacTime/Store/Database.swift \
     Sources/MacTime/Store/Crypto.swift \
     Sources/MacTime/Store/DataKeychain.swift \
     Sources/MacTime/Store/Rewrap.swift \
     Sources/MacTime/Store/Store.swift \
     Sources/MacTime/Store/Erase.swift \
+    Sources/MacTime/Store/Zip.swift \
+    Sources/MacTime/Store/Archive.swift \
+    Sources/MacTime/Store/Store+Archive.swift \
+    Sources/MacTime/Store/ArchiveExport.swift \
+    Sources/MacTime/Store/ArchiveImport.swift \
     Tests/TimeMathTests/main.swift \
     -o "$out"
 
