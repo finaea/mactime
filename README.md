@@ -5,8 +5,8 @@
 <h1 align="center">MacTime</h1>
 
 <p align="center">
-  A private timeline of screenshots and computer activity for macOS.<br>
-  A simple way to look back at the day and see where time went.
+  Screenshot timeline + app/browser activity tracking for macOS.<br>
+  A minimal tracking solution like Manictime designed for Mac.
 </p>
 
 <p align="center">
