@@ -139,4 +139,6 @@ tools/make-dmg.sh        # Create a DMG in publish/
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+[PolyForm Noncommercial 1.0.0](https://polyformproject.org/licenses/noncommercial/1.0.0) — see [LICENSE](LICENSE).
+
+The source is public: use it, modify it, fork it, and share your changes freely for any noncommercial purpose — personal use, hobby projects, study and research, and use inside charities, schools, and public institutions. Commercial use is not covered; open an issue if you want to discuss a commercial licence.
